@@ -109,6 +109,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dyn-warmup-steps", type=int, default=40, help="full-update warmup for relevance EMA")
     p.add_argument("--dyn-probe-every", type=int, default=20, help="full probe/update every K steps")
     p.add_argument("--dyn-refresh-every", type=int, default=80, help="forced full update every M steps")
+    p.add_argument(
+        "--dyn-relevance-metric",
+        type=str,
+        default="grad_ratio",
+        choices=["grad_ratio", "saliency_abs_gp"],
+        help="Per-block relevance metric on probe steps",
+    )
     p.add_argument("--dyn-relevance-threshold", type=float, default=0.9, help="top suffix cumulative relevance fraction")
     p.add_argument("--dyn-min-active-layers", type=int, default=4)
     p.add_argument("--dyn-max-active-layers", type=int, default=0, help="0 means no cap; otherwise cap active suffix size")
@@ -119,9 +126,45 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dyn-stability-window", type=int, default=12)
     p.add_argument("--dyn-stability-rel-change", type=float, default=0.02, help="relative mean-loss change threshold")
     p.add_argument("--dyn-stability-cv", type=float, default=0.03, help="coefficient-of-variation threshold")
-    p.add_argument("--dyn-final-full-frac", type=float, default=0.0, help="Force full updates in final fraction of run/time budget")
-    p.add_argument("--dyn-loss-upper", type=float, default=1.03, help="If probe loss > best_probe_loss * upper, increase active budget")
-    p.add_argument("--dyn-loss-lower", type=float, default=0.995, help="If probe loss < best_probe_loss * lower, decrease active budget")
+    p.add_argument(
+        "--dyn-final-full-frac",
+        type=float,
+        default=0.0,
+        help="Enable final recovery window in final fraction of run/time budget",
+    )
+    p.add_argument(
+        "--dyn-final-recovery-mode",
+        type=str,
+        default="full",
+        choices=["full", "staged"],
+        help="Behavior inside final recovery window (enabled when dyn-final-full-frac > 0)",
+    )
+    p.add_argument(
+        "--dyn-final-recovery-stage1-progress",
+        type=float,
+        default=0.34,
+        help="For staged mode: first boundary in [0,1] inside final window",
+    )
+    p.add_argument(
+        "--dyn-final-recovery-stage2-progress",
+        type=float,
+        default=0.67,
+        help="For staged mode: second boundary in [0,1] inside final window",
+    )
+    p.add_argument(
+        "--dyn-final-recovery-stage1-layers",
+        type=int,
+        default=14,
+        help="For staged mode: minimum active layers in stage 1",
+    )
+    p.add_argument(
+        "--dyn-final-recovery-stage2-layers",
+        type=int,
+        default=16,
+        help="For staged mode: minimum active layers in stage 2",
+    )
+    p.add_argument("--dyn-loss-upper", type=float, default=1.03, help="If probe loss > probe_loss_ema * upper, increase active budget")
+    p.add_argument("--dyn-loss-lower", type=float, default=0.995, help="If probe loss < probe_loss_ema * lower, decrease active budget")
     p.add_argument("--dyn-budget-step-up", type=int, default=2)
     p.add_argument("--dyn-budget-step-down", type=int, default=1)
     p.add_argument("--dyn-loss-ema-decay", type=float, default=0.9, help="EMA decay for probe-loss adaptation signal")
@@ -242,18 +285,29 @@ def evaluate_val_loss(model: TinyStack, val_set: list[tuple[torch.Tensor, torch.
 def block_relevance_scores(
     model: TinyStack,
     eps: float,
+    metric: str,
 ) -> list[float]:
     scores: list[float] = []
+    if metric not in {"grad_ratio", "saliency_abs_gp"}:
+        raise ValueError(f"Unknown relevance metric: {metric}")
     for b in model.blocks:
-        g2 = 0.0
-        w2 = 0.0
-        for p in b.parameters():
-            if p.grad is not None:
-                g2 += p.grad.float().pow(2).sum().item()
-            w2 += p.data.float().pow(2).sum().item()
-        g = math.sqrt(max(g2, 0.0))
-        w = math.sqrt(max(w2, 0.0))
-        scores.append(g / (w + eps))
+        if metric == "grad_ratio":
+            g2 = 0.0
+            w2 = 0.0
+            for p in b.parameters():
+                if p.grad is not None:
+                    g2 += p.grad.float().pow(2).sum().item()
+                w2 += p.data.float().pow(2).sum().item()
+            g = math.sqrt(max(g2, 0.0))
+            w = math.sqrt(max(w2, 0.0))
+            scores.append(g / (w + eps))
+        else:
+            saliency = 0.0
+            for p in b.parameters():
+                if p.grad is None:
+                    continue
+                saliency += (p.grad.float() * p.data.float()).abs().sum().item()
+            scores.append(saliency)
     return scores
 
 
@@ -351,6 +405,12 @@ def run_schedule(
     active_start_dyn = max(0, n - active_budget)
     best_probe_loss = float("inf")
     probe_loss_ema = None
+    stage1_progress = float(min(1.0, max(0.0, args.dyn_final_recovery_stage1_progress)))
+    stage2_progress = float(min(1.0, max(0.0, args.dyn_final_recovery_stage2_progress)))
+    if stage2_progress < stage1_progress:
+        stage2_progress = stage1_progress
+    stage1_layers = max(min_active, min(args.dyn_final_recovery_stage1_layers, n))
+    stage2_layers = max(stage1_layers, min(args.dyn_final_recovery_stage2_layers, n))
 
     freeze_enabled = schedule != "dynamic_suffix"
     if schedule == "dynamic_suffix":
@@ -368,6 +428,7 @@ def run_schedule(
     active_layers_hist: list[int] = []
     probe_steps = 0
     dynamic_trace: list[dict] = []
+    prev_final_recovery_stage = None
 
     elapsed_ms = 0.0
     step = 0
@@ -410,24 +471,70 @@ def run_schedule(
                         }
                     )
 
-            # Optional final recovery phase: full updates near the end.
+            # Optional final recovery phase near the end.
+            final_recovery_active_start = None
+            final_recovery_stage = None
+            final_recovery_progress = None
             if args.dyn_final_full_frac > 0:
                 if time_budget_ms is not None and time_budget_ms > 0:
-                    final_full = elapsed_ms >= (1.0 - args.dyn_final_full_frac) * time_budget_ms
+                    recovery_start = (1.0 - args.dyn_final_full_frac) * time_budget_ms
+                    in_recovery = elapsed_ms >= recovery_start
+                    if in_recovery:
+                        denom = max(args.dyn_final_full_frac * time_budget_ms, 1e-9)
+                        final_recovery_progress = float(min(1.0, max(0.0, (elapsed_ms - recovery_start) / denom)))
                 else:
-                    final_full = step >= int((1.0 - args.dyn_final_full_frac) * steps_limit)
-            else:
-                final_full = False
+                    recovery_start = int((1.0 - args.dyn_final_full_frac) * steps_limit)
+                    in_recovery = step >= recovery_start
+                    if in_recovery:
+                        denom = max(1, steps_limit - recovery_start)
+                        final_recovery_progress = float(min(1.0, max(0.0, (step - recovery_start) / denom)))
+
+                if in_recovery:
+                    if args.dyn_final_recovery_mode == "full":
+                        final_recovery_stage = "full"
+                        final_recovery_active_start = 0
+                    else:
+                        current_active_layers = n - active_start_dyn
+                        if final_recovery_progress is None:
+                            progress = 1.0
+                        else:
+                            progress = final_recovery_progress
+                        if progress >= stage2_progress:
+                            final_recovery_stage = "stage3_full"
+                            target_active_layers = n
+                        elif progress >= stage1_progress:
+                            final_recovery_stage = "stage2"
+                            target_active_layers = max(current_active_layers, stage2_layers)
+                        else:
+                            final_recovery_stage = "stage1"
+                            target_active_layers = max(current_active_layers, stage1_layers)
+                        target_active_layers = min(n, max(min_active, target_active_layers))
+                        final_recovery_active_start = max(0, n - target_active_layers)
+
+            if schedule == "dynamic_suffix" and final_recovery_stage != prev_final_recovery_stage:
+                if final_recovery_stage is not None:
+                    dynamic_trace.append(
+                        {
+                            "step": step,
+                            "final_recovery_mode": args.dyn_final_recovery_mode,
+                            "final_recovery_stage": final_recovery_stage,
+                            "final_recovery_progress": final_recovery_progress,
+                            "final_recovery_active_layers": n - final_recovery_active_start,
+                        }
+                    )
+                prev_final_recovery_stage = final_recovery_stage
 
             # Probe conditions: warmup, periodic probe, periodic refresh.
             is_warmup = step < args.dyn_warmup_steps
             is_periodic_probe = (args.dyn_probe_every > 0 and step % args.dyn_probe_every == 0)
             is_refresh = (args.dyn_refresh_every > 0 and step % args.dyn_refresh_every == 0)
-            is_probe = (is_warmup or is_periodic_probe or is_refresh) and (not final_full)
+            is_probe = (is_warmup or is_periodic_probe or is_refresh) and (final_recovery_active_start is None)
 
             # Before freeze is enabled, stay full-update (but still allow probes for relevance signals).
-            if (not freeze_enabled) or final_full:
+            if not freeze_enabled:
                 active_start = 0
+            elif final_recovery_active_start is not None:
+                active_start = final_recovery_active_start
             else:
                 active_start = 0 if is_probe else active_start_dyn
         else:
@@ -460,7 +567,7 @@ def run_schedule(
                     + (1.0 - args.dyn_loss_ema_decay) * probe_loss
                 )
 
-            scores = block_relevance_scores(model, eps=args.dyn_eps)
+            scores = block_relevance_scores(model, eps=args.dyn_eps, metric=args.dyn_relevance_metric)
             for i, s in enumerate(scores):
                 ema_scores[i] = args.dyn_ema_decay * ema_scores[i] + (1.0 - args.dyn_ema_decay) * s
 
@@ -523,10 +630,15 @@ def run_schedule(
             "full update" if schedule == "full_update" else
             f"static active suffix={n-static_active_start}" if schedule == "static_suffix" else
             (
-                "dynamic relevance-guided active suffix"
+                f"dynamic relevance-guided active suffix (metric={args.dyn_relevance_metric})"
                 + (" + adaptive budget" if args.dyn_adapt_budget else "")
                 + (" + stability-gated freeze" if args.dyn_require_stable else "")
-                + (f" + final_full_frac={args.dyn_final_full_frac}" if args.dyn_final_full_frac > 0 else "")
+                + (
+                    f" + final_recovery={args.dyn_final_recovery_mode}"
+                    f"@frac={args.dyn_final_full_frac}"
+                    if args.dyn_final_full_frac > 0
+                    else ""
+                )
             )
         ),
     )
@@ -683,6 +795,7 @@ def main() -> None:
                 "dyn_warmup_steps": args.dyn_warmup_steps,
                 "dyn_probe_every": args.dyn_probe_every,
                 "dyn_refresh_every": args.dyn_refresh_every,
+                "dyn_relevance_metric": args.dyn_relevance_metric,
                 "dyn_relevance_threshold": args.dyn_relevance_threshold,
                 "dyn_min_active_layers": args.dyn_min_active_layers,
                 "dyn_max_active_layers": args.dyn_max_active_layers,
@@ -694,6 +807,11 @@ def main() -> None:
                 "dyn_stability_rel_change": args.dyn_stability_rel_change,
                 "dyn_stability_cv": args.dyn_stability_cv,
                 "dyn_final_full_frac": args.dyn_final_full_frac,
+                "dyn_final_recovery_mode": args.dyn_final_recovery_mode,
+                "dyn_final_recovery_stage1_progress": args.dyn_final_recovery_stage1_progress,
+                "dyn_final_recovery_stage2_progress": args.dyn_final_recovery_stage2_progress,
+                "dyn_final_recovery_stage1_layers": args.dyn_final_recovery_stage1_layers,
+                "dyn_final_recovery_stage2_layers": args.dyn_final_recovery_stage2_layers,
                 "dyn_loss_upper": args.dyn_loss_upper,
                 "dyn_loss_lower": args.dyn_loss_lower,
                 "dyn_budget_step_up": args.dyn_budget_step_up,
