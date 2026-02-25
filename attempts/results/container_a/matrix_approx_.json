@@ -1,0 +1,124 @@
+{
+  "script": "matrix_approx_bench.py",
+  "timestamp_utc": "2026-02-25T15:39:55Z",
+  "config": {
+    "device_arg": "auto",
+    "resolved_device": "cuda",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "tokens": 16384,
+    "dmodel": 1664,
+    "expansion": 4,
+    "rank_fracs": [
+      1.0,
+      0.75,
+      0.5,
+      0.375,
+      0.25
+    ],
+    "warmup": 10,
+    "iters": 30,
+    "benchmark": "both"
+  },
+  "system": {
+    "cuda_available": true,
+    "cuda_device_name": "NVIDIA GeForce RTX 4090",
+    "torch_version": "2.9.1+cu128"
+  },
+  "results": {
+    "linear": [
+      {
+        "name": "dense_linear",
+        "rank": -1,
+        "ms": 0.5654051666624582,
+        "flops": 90731184128.0,
+        "tflops": 160.4710913124105,
+        "speedup_vs_dense": 1.0,
+        "rel_l2_error": null
+      },
+      {
+        "name": "low_rank_linear(frac=0.750)",
+        "rank": 1248,
+        "ms": 0.8382603333302541,
+        "flops": 136096776192.0,
+        "tflops": 162.35621653635042,
+        "speedup_vs_dense": 0.6744982962705721,
+        "rel_l2_error": 0.1140570567359674
+      },
+      {
+        "name": "low_rank_linear(frac=0.500)",
+        "rank": 832,
+        "ms": 0.5583796666693767,
+        "flops": 90731184128.0,
+        "tflops": 162.49012910730332,
+        "speedup_vs_dense": 1.0125819409488659,
+        "rel_l2_error": 0.3263333599233913
+      },
+      {
+        "name": "low_rank_linear(frac=0.375)",
+        "rank": 624,
+        "ms": 0.42535293332548463,
+        "flops": 68048388096.0,
+        "tflops": 159.98100110415515,
+        "speedup_vs_dense": 1.3292612378196629,
+        "rel_l2_error": 0.46045637639251974
+      },
+      {
+        "name": "low_rank_linear(frac=0.250)",
+        "rank": 416,
+        "ms": 0.3103168000052392,
+        "flops": 45365592064.0,
+        "tflops": 146.19122156207487,
+        "speedup_vs_dense": 1.8220256417084484,
+        "rel_l2_error": 0.6141250668634771
+      }
+    ],
+    "mlp": [
+      {
+        "name": "dense_mlp(exp=4)",
+        "rank": -1,
+        "ms": 5.122717566670569,
+        "flops": 725849473024.0,
+        "tflops": 141.69226852296575,
+        "speedup_vs_dense": 1.0,
+        "rel_l2_error": null
+      },
+      {
+        "name": "low_rank_mlp(frac=0.750)",
+        "rank": 1248,
+        "ms": 4.975773533321141,
+        "flops": 680483880960.0,
+        "tflops": 136.75941567738568,
+        "speedup_vs_dense": 1.0295318973754315,
+        "rel_l2_error": 0.4803400800914171
+      },
+      {
+        "name": "low_rank_mlp(frac=0.500)",
+        "rank": 832,
+        "ms": 3.605878433336329,
+        "flops": 453655920640.0,
+        "tflops": 125.81009843425478,
+        "speedup_vs_dense": 1.4206573131559481,
+        "rel_l2_error": 0.7418339212040683
+      },
+      {
+        "name": "low_rank_mlp(frac=0.375)",
+        "rank": 624,
+        "ms": 3.000641266665601,
+        "flops": 340241940480.0,
+        "tflops": 113.38974247264373,
+        "speedup_vs_dense": 1.7072075971157592,
+        "rel_l2_error": 0.8448949885954484
+      },
+      {
+        "name": "low_rank_mlp(frac=0.250)",
+        "rank": 416,
+        "ms": 2.3751919666665344,
+        "flops": 226827960320.0,
+        "tflops": 95.49879062547602,
+        "speedup_vs_dense": 2.1567593855834954,
+        "rel_l2_error": 0.9269994658548074
+      }
+    ]
+  }
+}
