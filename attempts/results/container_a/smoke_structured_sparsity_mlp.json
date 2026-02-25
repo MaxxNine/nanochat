@@ -1,0 +1,57 @@
+{
+  "script": "structured_sparsity_mlp_bench.py",
+  "timestamp_utc": "2026-02-25T17:01:34Z",
+  "config": {
+    "device_arg": "cpu",
+    "resolved_device": "cpu",
+    "dtype": "float32",
+    "seed": 42,
+    "dmodel": 128,
+    "expansion": 2,
+    "tokens_val": 256,
+    "tokens_bench": 512,
+    "keep_fracs": [
+      0.5
+    ],
+    "warmup": 1,
+    "iters": 2,
+    "skip_2to4": false
+  },
+  "system": {
+    "cuda_available": false,
+    "cuda_device_name": null,
+    "torch_version": "2.9.1+cu128"
+  },
+  "baseline": {
+    "dense_ms": 0.20499299989751307,
+    "dense_flops": 67108864.0
+  },
+  "results": [
+    {
+      "method": "mask_2to4_dense_kernel",
+      "keep_frac": 0.5,
+      "hidden_kept": 256,
+      "val_rel_l2_error": 0.5370954024352266,
+      "ms": 0.16544899972359417,
+      "flops": 33554432.0,
+      "tflops": 0.2028083098480946,
+      "speedup_vs_dense": 1.2390102100344076,
+      "nnz_frac_w1": 0.5,
+      "nnz_frac_w2": 0.5,
+      "notes": "runtime uses dense kernels; speedup may be limited"
+    },
+    {
+      "method": "neuron_prune",
+      "keep_frac": 0.5,
+      "hidden_kept": 128,
+      "val_rel_l2_error": 0.607126336692068,
+      "ms": 0.10979000035149511,
+      "flops": 33554432.0,
+      "tflops": 0.3056237534618339,
+      "speedup_vs_dense": 1.867137255134561,
+      "nnz_frac_w1": 0.5,
+      "nnz_frac_w2": 0.5,
+      "notes": "true structured reduction (reduced hidden dimension)"
+    }
+  ]
+}

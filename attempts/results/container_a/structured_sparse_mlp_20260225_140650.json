@@ -1,0 +1,99 @@
+{
+  "script": "structured_sparsity_mlp_bench.py",
+  "timestamp_utc": "2026-02-25T17:06:52Z",
+  "config": {
+    "device_arg": "auto",
+    "resolved_device": "cuda",
+    "dtype": "bfloat16",
+    "seed": 42,
+    "dmodel": 1664,
+    "expansion": 4,
+    "tokens_val": 8192,
+    "tokens_bench": 16384,
+    "keep_fracs": [
+      0.75,
+      0.5,
+      0.375,
+      0.25
+    ],
+    "warmup": 10,
+    "iters": 30,
+    "skip_2to4": false
+  },
+  "system": {
+    "cuda_available": true,
+    "cuda_device_name": "NVIDIA GeForce RTX 4090",
+    "torch_version": "2.9.1+cu128"
+  },
+  "baseline": {
+    "dense_ms": 5.4326067000147304,
+    "dense_flops": 725849473024.0
+  },
+  "results": [
+    {
+      "method": "mask_2to4_dense_kernel",
+      "keep_frac": 0.5,
+      "hidden_kept": 6656,
+      "val_rel_l2_error": 0.5282020210305937,
+      "ms": 5.12520276667298,
+      "flops": 362924736512.0,
+      "tflops": 70.81178112053355,
+      "speedup_vs_dense": 1.0599788822679694,
+      "nnz_frac_w1": 0.5,
+      "nnz_frac_w2": 0.5,
+      "notes": "runtime uses dense kernels; speedup may be limited"
+    },
+    {
+      "method": "neuron_prune",
+      "keep_frac": 0.75,
+      "hidden_kept": 4992,
+      "val_rel_l2_error": 0.4768906329601996,
+      "ms": 3.8935309333586097,
+      "flops": 544387104768.0,
+      "tflops": 139.81835873033754,
+      "speedup_vs_dense": 1.3952904941552613,
+      "nnz_frac_w1": 0.75,
+      "nnz_frac_w2": 0.75,
+      "notes": "true structured reduction (reduced hidden dimension)"
+    },
+    {
+      "method": "neuron_prune",
+      "keep_frac": 0.5,
+      "hidden_kept": 3328,
+      "val_rel_l2_error": 0.6845724812640258,
+      "ms": 2.5956884999686736,
+      "flops": 362924736512.0,
+      "tflops": 139.81829349568716,
+      "speedup_vs_dense": 2.09293476473787,
+      "nnz_frac_w1": 0.5,
+      "nnz_frac_w2": 0.5,
+      "notes": "true structured reduction (reduced hidden dimension)"
+    },
+    {
+      "method": "neuron_prune",
+      "keep_frac": 0.375,
+      "hidden_kept": 2496,
+      "val_rel_l2_error": 0.7711108006694714,
+      "ms": 1.9708769999851938,
+      "flops": 272193552384.0,
+      "tflops": 138.10783340921063,
+      "speedup_vs_dense": 2.756441269574683,
+      "nnz_frac_w1": 0.375,
+      "nnz_frac_w2": 0.375,
+      "notes": "true structured reduction (reduced hidden dimension)"
+    },
+    {
+      "method": "neuron_prune",
+      "keep_frac": 0.25,
+      "hidden_kept": 1664,
+      "val_rel_l2_error": 0.8503514745295473,
+      "ms": 1.2409765333359246,
+      "flops": 181462368256.0,
+      "tflops": 146.22546307801878,
+      "speedup_vs_dense": 4.377686889381459,
+      "nnz_frac_w1": 0.25,
+      "nnz_frac_w2": 0.25,
+      "notes": "true structured reduction (reduced hidden dimension)"
+    }
+  ]
+}

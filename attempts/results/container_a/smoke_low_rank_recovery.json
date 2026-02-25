@@ -1,0 +1,50 @@
+{
+  "script": "loss_aware_low_rank_recovery.py",
+  "timestamp_utc": "2026-02-25T16:41:46Z",
+  "config": {
+    "device_arg": "cpu",
+    "resolved_device": "cpu",
+    "dtype": "float32",
+    "seed": 42,
+    "benchmark": "linear",
+    "dmodel": 128,
+    "expansion": 4,
+    "tokens_train": 1024,
+    "tokens_val": 256,
+    "tokens_bench": 512,
+    "rank_fracs": [
+      0.5
+    ],
+    "steps": 5,
+    "batch_size": 128,
+    "lr": 0.003,
+    "weight_decay": 0.0,
+    "warmup": 1,
+    "iters": 2
+  },
+  "system": {
+    "cuda_available": false,
+    "cuda_device_name": null,
+    "torch_version": "2.9.1+cu128"
+  },
+  "results": {
+    "linear": [
+      {
+        "name": "linear_low_rank(frac=0.500)",
+        "rank": 64,
+        "init_rel_l2_error": 0.324893679513499,
+        "final_rel_l2_error": 0.3335395884609132,
+        "error_reduction_frac": -0.026611502447079625,
+        "dense_ms": 0.05723200001739315,
+        "approx_ms": 0.04638149994207197,
+        "speedup_vs_dense": 1.2339402582683372,
+        "dense_flops": 16777216.0,
+        "approx_flops": 16777216.0,
+        "approx_tflops": 0.36172215260295276,
+        "train_loss_start": 14.287933349609375,
+        "train_loss_end": 13.419795989990234
+      }
+    ],
+    "mlp": []
+  }
+}
