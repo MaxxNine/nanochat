@@ -17,6 +17,7 @@ import gc
 import json
 import time
 import math
+import re
 import argparse
 from dataclasses import asdict
 from contextlib import nullcontext, contextmanager
@@ -43,8 +44,23 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # FP8 training
-parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
-parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+parser.add_argument("--fp8", action="store_true", help="enable FP8 training for eligible Linear layers")
+parser.add_argument("--fp8-backend", type=str, default="custom", choices=["custom", "torchao"], help="FP8 backend implementation (custom=repo implementation, torchao=official torchao)")
+parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (torchao-only)")
+parser.add_argument("--fp8-min-dim", type=int, default=128, help="minimum in/out feature size for FP8 Linear conversion")
+parser.add_argument("--fp8-skip-lm-head", action="store_true", help="skip FP8 conversion of lm_head for extra stability")
+parser.add_argument("--fp8-fast-accum", action="store_true", help="(custom backend) use lower-precision forward FP8 accumulation for speed; may reduce stability")
+parser.add_argument("--fp8-weight-grad-bf16", action="store_true", help="(custom backend) compute FP8 dWeight in BF16 for speed (default is FP32 for stability)")
+parser.add_argument("--fp8-no-allow-in-graph", action="store_true", help="(custom backend) do not mark FP8 autograd op as allow_in_graph; can avoid torch.compile NaNs")
+parser.add_argument("--fp8-skip-attn-qk", action="store_true", help="skip FP8 conversion for attention c_q/c_k linears (stability guard on some GPUs)")
+parser.add_argument("--fp8-include-regex", type=str, default="", help="optional regex: only convert Linear layers whose FQN matches")
+parser.add_argument("--fp8-exclude-regex", type=str, default="", help="optional regex: do not convert Linear layers whose FQN matches")
+parser.add_argument("--fp8-log-modules", action="store_true", help="print converted/skipped Linear module names for FP8")
+# Debugging
+parser.add_argument("--debug-nan", action="store_true", help="enable non-finite (NaN/Inf) debug checks during training")
+parser.add_argument("--debug-anomaly", action="store_true", help="enable PyTorch autograd anomaly detection (slow)")
+parser.add_argument("--debug-max-nonfinite", type=int, default=8, help="max number of non-finite tensors to print per check")
+parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -99,6 +115,9 @@ else:
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
+if args.debug_anomaly:
+    torch.autograd.set_detect_anomaly(True)
+    print0("DEBUG: autograd anomaly detection enabled")
 
 # Flash Attention status
 if HAS_FA3:
@@ -165,27 +184,77 @@ if args.fp8:
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
-        # our custom fp8 is simpler than torchao, written for exact API compatibility
-        from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
-        # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-        import torch.nn as nn
+        # Native FP8 matmuls are available on Hopper/Ada+ GPUs (e.g. H100/4090).
+        major, minor = torch.cuda.get_device_capability(0)
+        if (major, minor) < (8, 9):
+            print0(f"Warning: FP8 matmul is not supported on compute capability {major}.{minor}, ignoring --fp8 flag")
+        else:
+            if args.fp8_backend == "custom":
+                os.environ["NANOCHAT_FP8_ALLOW_IN_GRAPH"] = "0" if args.fp8_no_allow_in_graph else "1"
+                from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
+                if args.fp8_recipe != "tensorwise":
+                    raise ValueError(
+                        f"fp8-backend={args.fp8_backend} supports only tensorwise recipe, got fp8-recipe={args.fp8_recipe}"
+                    )
+            else:
+                from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+            import torch.nn as nn
 
-        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
-        def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
-            if not isinstance(mod, nn.Linear):
-                return False
-            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
-                return False
-            if min(mod.in_features, mod.out_features) < 128:
-                return False
-            return True
+            # Filter: dims must be divisible by 16 (FP8 hardware requirement) and be large enough.
+            def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
+                if not isinstance(mod, nn.Linear):
+                    return False
+                if args.fp8_include_regex and re.search(args.fp8_include_regex, fqn) is None:
+                    return False
+                if args.fp8_exclude_regex and re.search(args.fp8_exclude_regex, fqn) is not None:
+                    return False
+                if args.fp8_skip_lm_head and fqn == "lm_head":
+                    return False
+                if args.fp8_skip_attn_qk and re.search(r"\.attn\.(c_q|c_k)$", fqn) is not None:
+                    return False
+                if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+                    return False
+                if min(mod.in_features, mod.out_features) < args.fp8_min_dim:
+                    return False
+                return True
 
-        fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
-        num_linear = sum(1 for m in model.modules() if isinstance(m, nn.Linear))
-        convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
-        num_fp8 = sum(1 for m in model.modules() if 'Float8' in type(m).__name__)
-        num_skipped = num_linear - num_fp8
-        print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped} (too small)")
+            linear_fqns = sorted(name for name, m in model.named_modules() if isinstance(m, nn.Linear))
+            eligible_fqns = sorted(
+                name for name, m in model.named_modules()
+                if isinstance(m, nn.Linear) and fp8_module_filter(m, name)
+            )
+            fp8_config = Float8LinearConfig.from_recipe_name(args.fp8_recipe)
+            if args.fp8_backend == "custom":
+                fp8_config.use_fast_accum = args.fp8_fast_accum
+                fp8_config.weight_grad_fp32 = not args.fp8_weight_grad_bf16
+            num_linear = len(linear_fqns)
+            convert_to_float8_training(model, config=fp8_config, module_filter_fn=fp8_module_filter)
+            fp8_fqns = sorted(name for name, m in model.named_modules() if 'Float8' in type(m).__name__)
+            num_fp8 = len(fp8_fqns)
+            num_skipped = num_linear - num_fp8
+            print0(
+                f"✓ FP8 training enabled (backend={args.fp8_backend}, recipe={args.fp8_recipe}, "
+                f"min_dim={args.fp8_min_dim}, skip_lm_head={args.fp8_skip_lm_head}, "
+                f"skip_attn_qk={args.fp8_skip_attn_qk}, "
+                f"fast_accum={args.fp8_fast_accum if args.fp8_backend == 'custom' else 'n/a'}, "
+                f"weight_grad_fp32={not args.fp8_weight_grad_bf16 if args.fp8_backend == 'custom' else 'n/a'}, "
+                f"allow_in_graph={not args.fp8_no_allow_in_graph if args.fp8_backend == 'custom' else 'n/a'}) "
+                f"- converted {num_fp8}/{num_linear} linear layers, skipped {num_skipped}"
+            )
+            if args.fp8_log_modules:
+                skipped_fqns = [name for name in linear_fqns if name not in fp8_fqns]
+                print0("FP8 converted module names:")
+                for name in fp8_fqns:
+                    print0(f"  {name}")
+                print0("FP8 skipped module names:")
+                for name in skipped_fqns:
+                    print0(f"  {name}")
+            elif num_fp8 != len(eligible_fqns):
+                # Sanity check signal: conversion result should match filter expectation.
+                print0(
+                    f"WARNING: FP8 filter expected {len(eligible_fqns)} modules but converted {num_fp8}. "
+                    "Consider running with --fp8-log-modules to inspect."
+                )
 
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager
@@ -238,7 +307,37 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.no_compile:
+    print0("DEBUG: torch.compile disabled (--no-compile)")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+
+
+def debug_list_nonfinite_grads(model, max_items=8):
+    findings = []
+    for name, p in model.named_parameters():
+        g = p.grad
+        if g is None:
+            continue
+        finite = torch.isfinite(g)
+        if not finite.all():
+            num_bad = int((~finite).sum().item())
+            findings.append((name, g.dtype, tuple(g.shape), num_bad))
+            if len(findings) >= max_items:
+                break
+    return findings
+
+
+def debug_list_nonfinite_params(model, max_items=8):
+    findings = []
+    for name, p in model.named_parameters():
+        finite = torch.isfinite(p)
+        if not finite.all():
+            num_bad = int((~finite).sum().item())
+            findings.append((name, p.dtype, tuple(p.shape), num_bad))
+            if len(findings) >= max_items:
+                break
+    return findings
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -402,11 +501,13 @@ while True:
 
     # once in a while: evaluate the val bpb (all ranks participate)
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
-        model.eval()
+        # Run eval on the uncompiled module and disable FP8 there; mutating module
+        # topology inside a compiled wrapper can confuse graph caching.
+        orig_model.eval()
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with disable_fp8(model), autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        with disable_fp8(orig_model), autocast_ctx:
+            val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -493,9 +594,30 @@ while True:
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
+        if args.debug_nan:
+            loss_det = loss.detach()
+            if not torch.isfinite(loss_det):
+                x_min, x_max = int(x.min().item()), int(x.max().item())
+                y_valid = y[y >= 0]
+                if y_valid.numel() > 0:
+                    y_min, y_max = int(y_valid.min().item()), int(y_valid.max().item())
+                else:
+                    y_min, y_max = -1, -1
+                print0(
+                    f"DEBUG_NAN: non-finite forward loss at step={step} micro_step={micro_step} "
+                    f"loss={loss_det.item()} x_range=[{x_min},{x_max}] y_valid_range=[{y_min},{y_max}]"
+                )
+                raise RuntimeError("Non-finite forward loss detected")
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
+        if args.debug_nan:
+            bad_grads = debug_list_nonfinite_grads(orig_model, max_items=args.debug_max_nonfinite)
+            if bad_grads:
+                print0(f"DEBUG_NAN: non-finite gradients detected at step={step} micro_step={micro_step}")
+                for name, dtype, shape, num_bad in bad_grads:
+                    print0(f"  grad {name}: dtype={dtype} shape={shape} bad={num_bad}")
+                raise RuntimeError("Non-finite gradients detected")
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # step the optimizer
     lrm = get_lr_multiplier(step)
@@ -507,6 +629,13 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
+    if args.debug_nan:
+        bad_params = debug_list_nonfinite_params(orig_model, max_items=args.debug_max_nonfinite)
+        if bad_params:
+            print0(f"DEBUG_NAN: non-finite parameters detected right after optimizer.step() at step={step}")
+            for name, dtype, shape, num_bad in bad_params:
+                print0(f"  param {name}: dtype={dtype} shape={shape} bad={num_bad}")
+            raise RuntimeError("Non-finite parameters detected after optimizer step")
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
