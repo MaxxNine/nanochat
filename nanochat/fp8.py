@@ -69,6 +69,9 @@ subtly different floating-point rounding paths under torch.compile, since Induct
 generates a different graph. Numerics are bitwise identical in eager mode.
 """
 
+import os
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 
@@ -116,10 +119,14 @@ def _to_col_major(x):
     return x.t().contiguous().t()
 
 
-# allow_in_graph tells torch.compile to treat this as an opaque operation —
-# dynamo won't try to decompose it into smaller ops. See the module docstring
-# for how this differs from torchao's tensor subclass approach.
-@torch._dynamo.allow_in_graph
+_ALLOW_IN_GRAPH = os.environ.get("NANOCHAT_FP8_ALLOW_IN_GRAPH", "1") != "0"
+
+# allow_in_graph tells torch.compile to treat this as an opaque operation.
+# When disabled, this op becomes a graph-break boundary, which can be slower
+# but may avoid compiler-induced numerical issues for some PyTorch/GPU combos.
+_maybe_allow_in_graph = torch._dynamo.allow_in_graph if _ALLOW_IN_GRAPH else (lambda cls: cls)
+
+@_maybe_allow_in_graph
 class _Float8Matmul(torch.autograd.Function):
     """Custom autograd for the three FP8 GEMMs of a Linear layer.
 
@@ -128,11 +135,13 @@ class _Float8Matmul(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, input_2d, weight):
+    def forward(ctx, input_2d, weight, use_fast_accum, fp32_weight_grad):
         # Quantize both operands to e4m3 (higher precision format)
         input_fp8, input_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
         weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
         ctx.save_for_backward(input_fp8, input_inv, weight_fp8, weight_inv)
+        ctx.use_fast_accum = bool(use_fast_accum)
+        ctx.fp32_weight_grad = bool(fp32_weight_grad)
 
         # output = input @ weight.T
         # input_fp8 is [B, K] contiguous = row-major (good for first arg)
@@ -147,7 +156,7 @@ class _Float8Matmul(torch.autograd.Function):
             # use_fast_accum=True accumulates the dot products in lower precision.
             # Slightly less accurate but measurably faster. Standard practice for
             # the forward pass; we use False in backward for more precise gradients.
-            use_fast_accum=True,
+            use_fast_accum=ctx.use_fast_accum,
         )
         return output
 
@@ -178,16 +187,17 @@ class _Float8Matmul(torch.autograd.Function):
         # so we must call .contiguous() to physically rearrange the memory.
         go_T = go_fp8.t().contiguous()  # [N, B] row-major
         in_col = _to_col_major(in_fp8)    # [B, K] column-major
+        grad_weight_out_dtype = torch.float32 if ctx.fp32_weight_grad else grad_output.dtype
         grad_weight = torch._scaled_mm(
             go_T,
             in_col,
             scale_a=go_inv,
             scale_b=in_inv,
-            out_dtype=grad_output.dtype,
+            out_dtype=grad_weight_out_dtype,
             use_fast_accum=False,
         )
 
-        return grad_input, grad_weight
+        return grad_input, grad_weight, None, None
 
 
 class Float8Linear(nn.Linear):
@@ -206,14 +216,19 @@ class Float8Linear(nn.Linear):
         # _scaled_mm only works on 2D tensors, so flatten batch dimensions
         orig_shape = input.shape
         input_2d = input.reshape(-1, orig_shape[-1])
-        output = _Float8Matmul.apply(input_2d, self.weight)
+        output = _Float8Matmul.apply(
+            input_2d,
+            self.weight,
+            getattr(self, "_fp8_use_fast_accum", False),
+            getattr(self, "_fp8_weight_grad_fp32", True),
+        )
         output = output.reshape(*orig_shape[:-1], output.shape[-1])
         if self.bias is not None:
             output = output + self.bias.to(output.dtype)
         return output
 
     @classmethod
-    def from_float(cls, mod):
+    def from_float(cls, mod, *, config=None):
         """Create Float8Linear from nn.Linear, sharing the same weight and bias.
 
         Uses meta device to avoid allocating a temporary weight tensor — we
@@ -224,11 +239,20 @@ class Float8Linear(nn.Linear):
             new_mod = cls(mod.in_features, mod.out_features, bias=False)
         new_mod.weight = mod.weight
         new_mod.bias = mod.bias
+        new_mod._fp8_use_fast_accum = bool(getattr(config, "use_fast_accum", False))
+        new_mod._fp8_weight_grad_fp32 = bool(getattr(config, "weight_grad_fp32", True))
         return new_mod
 
 
+@dataclass
 class Float8LinearConfig:
-    """Minimal config matching torchao's API. Only tensorwise recipe is supported."""
+    """Minimal config matching torchao's API for tensorwise FP8 training."""
+
+    # Forward GEMM accumulation mode.
+    # False is generally more numerically stable on consumer GPUs.
+    use_fast_accum: bool = False
+    # Compute dWeight in FP32 (safer); disable for max speed at some stability risk.
+    weight_grad_fp32: bool = True
 
     @staticmethod
     def from_recipe_name(recipe_name):
@@ -252,15 +276,18 @@ def convert_to_float8_training(module, *, config=None, module_filter_fn=None):
         config: Float8LinearConfig (accepted for API compat, only tensorwise supported).
         module_filter_fn: Optional filter(module, fqn) -> bool. Only matching Linears
             are converted. Common use: skip layers with dims not divisible by 16
-            (hardware requirement for FP8 matmuls on H100).
+            (hardware requirement for FP8 matmuls on Hopper/Ada GPUs like H100/4090).
     """
+    if config is None:
+        config = Float8LinearConfig()
+
     def _convert(mod, prefix=""):
         for name, child in mod.named_children():
             fqn = f"{prefix}.{name}" if prefix else name
             _convert(child, fqn)
             if isinstance(child, nn.Linear) and not isinstance(child, Float8Linear):
                 if module_filter_fn is None or module_filter_fn(child, fqn):
-                    setattr(mod, name, Float8Linear.from_float(child))
+                    setattr(mod, name, Float8Linear.from_float(child, config=config))
 
     _convert(module)
     return module
