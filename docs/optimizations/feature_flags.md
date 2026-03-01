@@ -1,6 +1,6 @@
 # Feature Flags Source of Truth
 
-Date: 2026-02-28
+Date: 2026-03-01
 Scope: base model training (`scripts/base_train.py`) and local runners.
 
 This file is the canonical list of optimization feature flags used for 1x4090 experiments.
@@ -34,6 +34,14 @@ This file is the canonical list of optimization feature flags used for 1x4090 ex
 - `--dyn-eps`
 - `--dyn-log-every`
 
+## Muon Optimizer Flags
+- `--muon-active-only-stack`
+- `--muon-stack-chunk-size`
+
+## LM-Head CE Flags
+- `--lm-ce-backend {baseline,chunked}`
+- `--lm-ce-chunk-size`
+
 Notes:
 - Current implementation is dynamic-only (no static schedule in training code).
 - `dynamic_suffix` currently supports single-rank runs (`nproc_per_node=1`).
@@ -46,10 +54,19 @@ Notes:
 - `--debug-nan`
 - `--debug-anomaly`
 - `--debug-max-nonfinite`
+- `--debug-mem-every`
 
 ## Runner Environment Mapping (`runs/speedrun_small.sh`)
 FP8:
 - `USE_FP8`, `FP8_BACKEND`, `FP8_RECIPE`
+
+Muon:
+- `MUON_ACTIVE_ONLY_STACK`
+- `MUON_STACK_CHUNK_SIZE`
+
+LM-head CE:
+- `LM_CE_BACKEND`
+- `LM_CE_CHUNK_SIZE`
 
 Dynamic suffix:
 - `BLOCK_UPDATE_SCHEDULE`

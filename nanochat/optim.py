@@ -87,6 +87,48 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+
+def _iter_muon_ranges(params: list[Tensor], active_only_stack: bool, stack_chunk_size: int) -> list[tuple[int, int]]:
+    """
+    Return contiguous [start, end) index ranges for Muon stacking.
+
+    - active_only_stack=True  -> ranges cover only params with grad != None
+    - active_only_stack=False -> ranges cover all params
+    - stack_chunk_size>0      -> split ranges into chunks of this size
+    """
+    if active_only_stack:
+        selected = [i for i, p in enumerate(params) if p.grad is not None]
+    else:
+        selected = list(range(len(params)))
+    if not selected:
+        return []
+
+    # Build contiguous ranges from selected indices.
+    ranges: list[tuple[int, int]] = []
+    start = selected[0]
+    prev = selected[0]
+    for idx in selected[1:]:
+        if idx == prev + 1:
+            prev = idx
+            continue
+        ranges.append((start, prev + 1))
+        start = idx
+        prev = idx
+    ranges.append((start, prev + 1))
+
+    # Optional chunk splitting.
+    if stack_chunk_size <= 0:
+        return ranges
+    chunked: list[tuple[int, int]] = []
+    for s, e in ranges:
+        cur = s
+        while cur < e:
+            nxt = min(cur + stack_chunk_size, e)
+            chunked.append((cur, nxt))
+            cur = nxt
+    return chunked
+
+
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
@@ -234,6 +276,8 @@ class MuonAdamW(torch.optim.Optimizer):
         params: list[Tensor] = group['params']
         if not params:
             return
+        active_only_stack = bool(group.get("active_only_stack", False))
+        stack_chunk_size = int(group.get("stack_chunk_size", 0) or 0)
 
         # Get or create group-level buffers (stored in first param's state for convenience)
         p = params[0]
@@ -253,40 +297,142 @@ class MuonAdamW(torch.optim.Optimizer):
         second_momentum_buffer = state["second_momentum_buffer"]
         red_dim = -1 if shape[-2] >= shape[-1] else -2
 
-        # Stack grads and params (NOTE: this assumes all params have the same shape).
-        # Some feature-flagged schedules may intentionally skip gradients for a subset
-        # of blocks; treat missing grads as zeros and only copy back updated params
-        # for the active subset so skipped params remain unchanged.
-        active_indices = [i for i, p in enumerate(params) if p.grad is not None]
-        if not active_indices:
-            return
-        stacked_grads = torch.stack([p.grad if p.grad is not None else torch.zeros_like(p) for p in params])
-        stacked_params = torch.stack(params)
-
         # Fill all the 0-D tensors with current values
         self._muon_momentum_t.fill_(group["momentum"])
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
+        active_indices = [i for i, pp in enumerate(params) if pp.grad is not None]
+        if not active_indices:
+            return
+        all_active = len(active_indices) == num_params
 
-        # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
-        muon_step_fused(
-            stacked_grads,
-            stacked_params,
-            momentum_buffer,
-            second_momentum_buffer,
-            self._muon_momentum_t,
-            self._muon_lr_t,
-            self._muon_wd_t,
-            self._muon_beta2_t,
-            group["ns_steps"],
-            red_dim,
-        )
+        # Sparse-only optimization mode: when everything is active, use legacy one-shot
+        # stack/update to preserve the full-update memory/speed characteristics.
+        if active_only_stack and all_active:
+            stacked_grads = torch.stack([pp.grad for pp in params])  # type: ignore[arg-type]
+            stacked_params = torch.stack(params)
+            muon_step_fused(
+                stacked_grads,
+                stacked_params,
+                momentum_buffer,
+                second_momentum_buffer,
+                self._muon_momentum_t,
+                self._muon_lr_t,
+                self._muon_wd_t,
+                self._muon_beta2_t,
+                group["ns_steps"],
+                red_dim,
+            )
+            torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+            return
 
-        # Copy back only for params that participated in this step.
-        active_params = [params[i] for i in active_indices]
-        active_values = [stacked_params[i] for i in active_indices]
-        torch._foreach_copy_(active_params, active_values)
+        # Fast path: preserve legacy behavior exactly when feature flags are off.
+        if not active_only_stack and stack_chunk_size <= 0:
+            stacked_grads = torch.stack([pp.grad if pp.grad is not None else torch.zeros_like(pp) for pp in params])
+            stacked_params = torch.stack(params)
+            muon_step_fused(
+                stacked_grads,
+                stacked_params,
+                momentum_buffer,
+                second_momentum_buffer,
+                self._muon_momentum_t,
+                self._muon_lr_t,
+                self._muon_wd_t,
+                self._muon_beta2_t,
+                group["ns_steps"],
+                red_dim,
+            )
+            active_params = [params[i] for i in active_indices]
+            active_values = [stacked_params[i] for i in active_indices]
+            torch._foreach_copy_(active_params, active_values)
+            return
+
+        # Feature-flagged path:
+        # - active_only_stack: stack only active contiguous ranges
+        # - stack_chunk_size: split ranges to cap peak optimizer workspace
+        if active_only_stack and stack_chunk_size <= 0:
+            # Keep leading dim stable for compiled muon_step_fused when active ranges vary.
+            stack_chunk_size = num_params
+        ranges = _iter_muon_ranges(params, active_only_stack=active_only_stack, stack_chunk_size=stack_chunk_size)
+        if not ranges:
+            return
+        for s, e in ranges:
+            chunk_params = params[s:e]
+            chunk_len = e - s
+            stacked_params = torch.stack(chunk_params)
+            if active_only_stack:
+                # All chunk params are active by construction of ranges.
+                stacked_grads = torch.stack([pp.grad for pp in chunk_params])  # type: ignore[arg-type]
+                active_chunk = None
+            else:
+                stacked_grads = torch.stack([pp.grad if pp.grad is not None else torch.zeros_like(pp) for pp in chunk_params])
+                active_chunk = torch.tensor([pp.grad is not None for pp in chunk_params], dtype=torch.bool, device=device)
+
+            use_padded = stack_chunk_size > 0 and chunk_len < stack_chunk_size
+            if use_padded:
+                # Pad short chunks to fixed leading dim to avoid torch.compile recompilation storms.
+                pad_key = f"_muon_pad_buffers_{stack_chunk_size}"
+                pad = state.get(pad_key)
+                if pad is None:
+                    second_shape = (stack_chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (stack_chunk_size, 1, shape[-1])
+                    pad = dict(
+                        params=torch.empty(stack_chunk_size, *shape, dtype=dtype, device=device),
+                        grads=torch.zeros(stack_chunk_size, *shape, dtype=dtype, device=device),
+                        mom=torch.zeros(stack_chunk_size, *shape, dtype=dtype, device=device),
+                        second=torch.zeros(second_shape, dtype=dtype, device=device),
+                    )
+                    state[pad_key] = pad
+                pad_params = pad["params"]
+                pad_grads = pad["grads"]
+                pad_mom = pad["mom"]
+                pad_second = pad["second"]
+                pad_params.zero_()
+                pad_grads.zero_()
+                pad_mom.zero_()
+                pad_second.zero_()
+                pad_params[:chunk_len].copy_(stacked_params)
+                pad_grads[:chunk_len].copy_(stacked_grads)
+                pad_mom[:chunk_len].copy_(momentum_buffer[s:e])
+                pad_second[:chunk_len].copy_(second_momentum_buffer[s:e])
+                muon_step_fused(
+                    pad_grads,
+                    pad_params,
+                    pad_mom,
+                    pad_second,
+                    self._muon_momentum_t,
+                    self._muon_lr_t,
+                    self._muon_wd_t,
+                    self._muon_beta2_t,
+                    group["ns_steps"],
+                    red_dim,
+                )
+                momentum_buffer[s:e].copy_(pad_mom[:chunk_len])
+                second_momentum_buffer[s:e].copy_(pad_second[:chunk_len])
+                updated_params = pad_params[:chunk_len]
+            else:
+                muon_step_fused(
+                    stacked_grads,
+                    stacked_params,
+                    momentum_buffer[s:e],
+                    second_momentum_buffer[s:e],
+                    self._muon_momentum_t,
+                    self._muon_lr_t,
+                    self._muon_wd_t,
+                    self._muon_beta2_t,
+                    group["ns_steps"],
+                    red_dim,
+                )
+                updated_params = stacked_params
+
+            if active_chunk is None or bool(active_chunk.all()):
+                torch._foreach_copy_(chunk_params, list(updated_params.unbind(0)))
+            else:
+                idx_local = torch.nonzero(active_chunk, as_tuple=False).squeeze(1).tolist()
+                if idx_local:
+                    active_params = [chunk_params[i] for i in idx_local]
+                    active_values = [updated_params[i] for i in idx_local]
+                    torch._foreach_copy_(active_params, active_values)
 
     @torch.no_grad()
     def step(self):
@@ -411,13 +557,26 @@ class DistMuonAdamW(torch.optim.Optimizer):
         if not active_mask_base.any():
             return dict(no_active=True, chunk_size=chunk_size)
 
-        # Stack grads with zeros for inactive params, then zero-pad.
-        grad_stack = torch.stack([pp.grad if pp.grad is not None else torch.zeros_like(pp) for pp in params])
+        active_only_stack = bool(group.get("active_only_stack", False))
+        stack_chunk_size = int(group.get("stack_chunk_size", 0) or 0)
         active_mask = torch.zeros(padded_num_params, dtype=torch.bool, device=device)
         active_mask[:len(params)] = active_mask_base
 
         if world_size == 1:
+            if active_only_stack or stack_chunk_size > 0:
+                # Direct single-rank compute path avoids materializing full grad_stack
+                # when active-only/chunked Muon is enabled.
+                return dict(
+                    future=None,
+                    grad_chunk=None,
+                    stacked_grads=None,
+                    chunk_size=chunk_size,
+                    active_mask=active_mask,
+                    no_comm=True,
+                    no_comm_direct=True,
+                )
             # Single-rank torchrun path: no communication needed.
+            grad_stack = torch.stack([pp.grad if pp.grad is not None else torch.zeros_like(pp) for pp in params])
             return dict(
                 future=None,
                 grad_chunk=grad_stack,
@@ -427,6 +586,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 no_comm=True,
             )
 
+        # Stack grads with zeros for inactive params, then zero-pad.
+        grad_stack = torch.stack([pp.grad if pp.grad is not None else torch.zeros_like(pp) for pp in params])
         stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
         stacked_grads[:len(params)].copy_(grad_stack)
         if len(params) < padded_num_params:
@@ -493,8 +654,124 @@ class DistMuonAdamW(torch.optim.Optimizer):
         chunk_size = info['chunk_size']
         grad_chunk = info['grad_chunk']
         active_mask = info['active_mask']
+        active_only_stack = bool(group.get("active_only_stack", False))
+        stack_chunk_size = int(group.get("stack_chunk_size", 0) or 0)
         p = params[0]
         shape, device, dtype = p.shape, p.device, p.dtype
+
+        if info.get("no_comm_direct", False):
+            state = self.state[p]
+            if "momentum_buffer" not in state:
+                state["momentum_buffer"] = torch.zeros(len(params), *shape, dtype=dtype, device=device)
+            if "second_momentum_buffer" not in state:
+                state_shape = (len(params), shape[-2], 1) if shape[-2] >= shape[-1] else (len(params), 1, shape[-1])
+                state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
+            red_dim = -1 if shape[-2] >= shape[-1] else -2
+
+            self._muon_momentum_t.fill_(group["momentum"])
+            self._muon_beta2_t.fill_(group["beta2"])
+            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+            self._muon_wd_t.fill_(group["weight_decay"])
+            all_active = bool(active_mask[:len(params)].all().item())
+
+            # Sparse-only optimization mode: use legacy one-shot update on full-active steps.
+            if active_only_stack and all_active:
+                stacked_params = torch.stack(params)
+                stacked_grads = torch.stack([pp.grad for pp in params])  # type: ignore[arg-type]
+                muon_step_fused(
+                    stacked_grads,
+                    stacked_params,
+                    state["momentum_buffer"],
+                    state["second_momentum_buffer"],
+                    self._muon_momentum_t,
+                    self._muon_lr_t,
+                    self._muon_wd_t,
+                    self._muon_beta2_t,
+                    group["ns_steps"],
+                    red_dim,
+                )
+                torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+                return
+
+            if active_only_stack and stack_chunk_size <= 0:
+                # Keep leading dim stable for compiled muon_step_fused when active ranges vary.
+                stack_chunk_size = len(params)
+            ranges = _iter_muon_ranges(params, active_only_stack=active_only_stack, stack_chunk_size=stack_chunk_size)
+            for s, e in ranges:
+                chunk_params = params[s:e]
+                chunk_len = e - s
+                stacked_params = torch.stack(chunk_params)
+                if active_only_stack:
+                    stacked_grads = torch.stack([pp.grad for pp in chunk_params])  # type: ignore[arg-type]
+                    active_chunk = None
+                else:
+                    stacked_grads = torch.stack([pp.grad if pp.grad is not None else torch.zeros_like(pp) for pp in chunk_params])
+                    active_chunk = active_mask[s:e]
+
+                use_padded = stack_chunk_size > 0 and chunk_len < stack_chunk_size
+                if use_padded:
+                    pad_key = f"_muon_pad_buffers_{stack_chunk_size}"
+                    pad = state.get(pad_key)
+                    if pad is None:
+                        second_shape = (stack_chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (stack_chunk_size, 1, shape[-1])
+                        pad = dict(
+                            params=torch.empty(stack_chunk_size, *shape, dtype=dtype, device=device),
+                            grads=torch.zeros(stack_chunk_size, *shape, dtype=dtype, device=device),
+                            mom=torch.zeros(stack_chunk_size, *shape, dtype=dtype, device=device),
+                            second=torch.zeros(second_shape, dtype=dtype, device=device),
+                        )
+                        state[pad_key] = pad
+                    pad_params = pad["params"]
+                    pad_grads = pad["grads"]
+                    pad_mom = pad["mom"]
+                    pad_second = pad["second"]
+                    pad_params.zero_()
+                    pad_grads.zero_()
+                    pad_mom.zero_()
+                    pad_second.zero_()
+                    pad_params[:chunk_len].copy_(stacked_params)
+                    pad_grads[:chunk_len].copy_(stacked_grads)
+                    pad_mom[:chunk_len].copy_(state["momentum_buffer"][s:e])
+                    pad_second[:chunk_len].copy_(state["second_momentum_buffer"][s:e])
+                    muon_step_fused(
+                        pad_grads,
+                        pad_params,
+                        pad_mom,
+                        pad_second,
+                        self._muon_momentum_t,
+                        self._muon_lr_t,
+                        self._muon_wd_t,
+                        self._muon_beta2_t,
+                        group["ns_steps"],
+                        red_dim,
+                    )
+                    state["momentum_buffer"][s:e].copy_(pad_mom[:chunk_len])
+                    state["second_momentum_buffer"][s:e].copy_(pad_second[:chunk_len])
+                    updated_params = pad_params[:chunk_len]
+                else:
+                    muon_step_fused(
+                        stacked_grads,
+                        stacked_params,
+                        state["momentum_buffer"][s:e],
+                        state["second_momentum_buffer"][s:e],
+                        self._muon_momentum_t,
+                        self._muon_lr_t,
+                        self._muon_wd_t,
+                        self._muon_beta2_t,
+                        group["ns_steps"],
+                        red_dim,
+                    )
+                    updated_params = stacked_params
+
+                if active_chunk is None or bool(active_chunk.all()):
+                    torch._foreach_copy_(chunk_params, list(updated_params.unbind(0)))
+                else:
+                    idx_local = torch.nonzero(active_chunk, as_tuple=False).squeeze(1).tolist()
+                    if idx_local:
+                        active_params = [chunk_params[i] for i in idx_local]
+                        active_values = [updated_params[i] for i in idx_local]
+                        torch._foreach_copy_(active_params, active_values)
+            return
 
         # How many params does this rank own?
         start_idx = rank * chunk_size
