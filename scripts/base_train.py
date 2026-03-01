@@ -12,7 +12,9 @@ python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 -
 """
 
 import os
-os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+# Respect user-provided allocator config; otherwise enable fragmentation-friendly default.
+if "PYTORCH_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import gc
 import json
 import time
@@ -79,6 +81,7 @@ parser.add_argument("--dyn-freeze-start-frac", type=float, default=0.5, help="dy
 parser.add_argument("--dyn-ema-decay", type=float, default=0.9, help="dynamic_suffix: EMA decay for block relevance")
 parser.add_argument("--dyn-eps", type=float, default=1e-8, help="dynamic_suffix: epsilon for numerical stability in relevance metrics")
 parser.add_argument("--dyn-log-every", type=int, default=20, help="dynamic_suffix: log active suffix/probe info every N steps")
+parser.add_argument("--empty-cache-before-probe", action="store_true", help="dynamic_suffix: call torch.cuda.empty_cache() before probe/full steps to reduce allocator fragmentation OOMs")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -660,6 +663,8 @@ if dynamic_suffix_enabled:
         f"warmup={args.dyn_warmup_steps}, probe_every={args.dyn_probe_every}, "
         f"refresh_every={args.dyn_refresh_every}, freeze_start_step={dyn_freeze_start_step}"
     )
+    if args.empty_cache_before_probe and device_type == "cuda":
+        print0("Dynamic suffix memory guard: empty_cache_before_probe enabled")
     if not args.no_compile:
         print0("NOTE: dynamic_suffix compile mode caches compiled graphs per active_start; eager is fallback on compile failures.")
 else:
@@ -779,18 +784,10 @@ while True:
     mem_debug_step = device_type == "cuda" and args.debug_mem_every > 0 and (
         step < 5 or (step % max(1, args.debug_mem_every) == 0)
     )
-    mem_before_alloc = get_cur_memory()
-    mem_before_reserved = get_reserved_memory()
     phase_fwd_peak_bytes = 0.0
     phase_bwd_peak_bytes = 0.0
     phase_opt_peak_bytes = 0.0
     phase_zero_peak_bytes = 0.0
-    if mem_debug_step:
-        # For phase attribution we reset the CUDA peak tracker per phase.
-        # This intentionally sacrifices "whole-step single counter" on debug steps.
-        torch.cuda.reset_peak_memory_stats()
-    synchronize()
-    t0 = time.time()
     step_is_probe = False
     active_start_this_step = 0
     if dynamic_suffix_enabled:
@@ -804,6 +801,25 @@ while True:
         dyn_active_layers_hist.append(active_layers_this_step)
     else:
         active_layers_this_step = None
+
+    # Probe/full steps can trigger allocator fragmentation at larger depths.
+    # Optional feature flag to release cached blocks before the heavy phase.
+    if (
+        device_type == "cuda"
+        and dynamic_suffix_enabled
+        and step_is_probe
+        and args.empty_cache_before_probe
+    ):
+        torch.cuda.empty_cache()
+
+    mem_before_alloc = get_cur_memory()
+    mem_before_reserved = get_reserved_memory()
+    if mem_debug_step:
+        # For phase attribution we reset the CUDA peak tracker per phase.
+        # This intentionally sacrifices "whole-step single counter" on debug steps.
+        torch.cuda.reset_peak_memory_stats()
+    synchronize()
+    t0 = time.time()
 
     for micro_step in range(grad_accum_steps):
         if mem_debug_step:

@@ -15,6 +15,10 @@ set -euo pipefail
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
+# Prefer fragmentation-friendly allocator settings unless caller overrides.
+if [ -z "${PYTORCH_ALLOC_CONF:-}" ]; then
+    export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF_DEFAULT:-expandable_segments:True,max_split_size_mb:128}"
+fi
 mkdir -p "$NANOCHAT_BASE_DIR"
 
 SKIP_SETUP="${SKIP_SETUP:-0}"
@@ -127,6 +131,7 @@ DYN_FREEZE_START_FRAC="${DYN_FREEZE_START_FRAC:-0.15}"
 DYN_EMA_DECAY="${DYN_EMA_DECAY:-0.9}"
 DYN_EPS="${DYN_EPS:-1e-8}"
 DYN_LOG_EVERY="${DYN_LOG_EVERY:-20}"
+EMPTY_CACHE_BEFORE_PROBE="${EMPTY_CACHE_BEFORE_PROBE:-1}"  # 0|1
 DEBUG_MEM_EVERY="${DEBUG_MEM_EVERY:-0}"
 
 BASE_TRAIN_ARGS=(
@@ -180,6 +185,10 @@ if [ "$DEBUG_MEM_EVERY" -gt 0 ]; then
     BASE_TRAIN_ARGS+=("--debug-mem-every=$DEBUG_MEM_EVERY")
 fi
 
+if [ "$EMPTY_CACHE_BEFORE_PROBE" = "1" ]; then
+    BASE_TRAIN_ARGS+=("--empty-cache-before-probe")
+fi
+
 # Stability-first fallback for the hardest combo (dynamic suffix + custom FP8).
 FP8_DYNAMIC_SAFE_ARGS="${FP8_DYNAMIC_SAFE_ARGS:---fp8-skip-lm-head --fp8-skip-attn-qk --fp8-min-dim=256 --fp8-no-allow-in-graph}"
 if [ "$USE_FP8" = "1" ] && [ "$FP8_BACKEND" = "custom" ] && [ "$BLOCK_UPDATE_SCHEDULE" = "dynamic_suffix" ] && [ "${FP8_DYNAMIC_AUTO_SAFE:-1}" = "1" ]; then
@@ -200,6 +209,7 @@ echo "run=$RUN_NAME model_tag=$MODEL_TAG nproc=$NPROC_PER_NODE max_restarts=$TOR
 echo "lm_ce: backend=$LM_CE_BACKEND chunk_size=$LM_CE_CHUNK_SIZE"
 echo "muon: active_only_stack=$MUON_ACTIVE_ONLY_STACK stack_chunk_size=$MUON_STACK_CHUNK_SIZE"
 echo "dynamic: warmup=$DYN_WARMUP_STEPS probe_every=$DYN_PROBE_EVERY refresh_every=$DYN_REFRESH_EVERY min_active=$DYN_MIN_ACTIVE_LAYERS max_active=$DYN_MAX_ACTIVE_LAYERS freeze_start_step=$DYN_FREEZE_START_STEP freeze_start_frac=$DYN_FREEZE_START_FRAC threshold=$DYN_RELEVANCE_THRESHOLD"
+echo "memory-guard: empty_cache_before_probe=$EMPTY_CACHE_BEFORE_PROBE cuda_alloc_conf=${PYTORCH_ALLOC_CONF:-unset}"
 if [ "$DEBUG_MEM_EVERY" -gt 0 ]; then
     echo "memory-debug: every=$DEBUG_MEM_EVERY steps"
 fi
