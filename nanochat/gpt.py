@@ -385,7 +385,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean', active_start=0):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -400,10 +400,30 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+        n_layers = len(self.transformer.h)
+        active_start = int(active_start) if active_start is not None else 0
+        active_start = max(0, min(active_start, n_layers))
+
+        # Dynamic suffix training mode: run prefix blocks under no_grad and detach.
+        # This freezes a contiguous prefix while still training the suffix blocks.
+        if active_start > 0:
+            if kv_cache is not None:
+                raise ValueError("active_start > 0 is not supported with kv_cache inference")
+            with torch.no_grad():
+                for i in range(active_start):
+                    x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                    ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                    x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            x = x.detach()
+            for i in range(active_start, n_layers):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], kv_cache)
+        else:
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)

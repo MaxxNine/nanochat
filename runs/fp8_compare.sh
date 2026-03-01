@@ -55,7 +55,7 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 PREPARE_DATA="${PREPARE_DATA:-auto}"
 SKIP_SETUP="${SKIP_SETUP:-0}"
 
-echo "variant,use_fp8,fp8_backend,fp8_recipe,exit_code,status,elapsed_sec,max_tok_per_sec,avg_tok_per_sec,final_loss,min_val_bpb,peak_vram_mib,fp8_layers,log_file" > "$SUMMARY_CSV"
+echo "variant,use_fp8,fp8_backend,fp8_recipe,exit_code,status,elapsed_sec,max_tok_per_sec,avg_tok_per_sec,final_loss,min_val_bpb,avg_vram_mib,peak_vram_mib,fp8_layers,log_file" > "$SUMMARY_CSV"
 
 extract_max_tok_per_sec() {
     local log_file="$1"
@@ -146,6 +146,21 @@ extract_peak_vram_mib() {
     fi
 }
 
+extract_avg_vram_mib() {
+    local log_file="$1"
+    local value
+    if [ ! -f "$log_file" ]; then
+        echo "NA"
+        return
+    fi
+    value="$(grep -E 'Average memory usage:' "$log_file" | tail -1 | sed -E 's/.*: ([0-9.]+)MiB.*/\1/' || true)"
+    if [ -z "$value" ]; then
+        echo "NA"
+    else
+        echo "$value"
+    fi
+}
+
 extract_fp8_layers() {
     local log_file="$1"
     local value
@@ -169,7 +184,7 @@ run_case() {
     local extra_args="$5"
     local log_file="$RESULTS_DIR/${variant}.log"
     local start_ts end_ts elapsed_sec exit_code status
-    local max_tok avg_tok final_loss min_val_bpb peak_vram fp8_layers case_run_name
+    local max_tok avg_tok final_loss min_val_bpb avg_vram peak_vram fp8_layers case_run_name
 
     if [ "$WANDB_RUN_COMPARE" = "dummy" ]; then
         case_run_name="dummy"
@@ -221,10 +236,11 @@ run_case() {
     avg_tok="$(extract_avg_tok_per_sec "$log_file")"
     final_loss="$(extract_final_loss "$log_file")"
     min_val_bpb="$(extract_min_val_bpb "$log_file")"
+    avg_vram="$(extract_avg_vram_mib "$log_file")"
     peak_vram="$(extract_peak_vram_mib "$log_file")"
     fp8_layers="$(extract_fp8_layers "$log_file")"
 
-    echo "$variant,$use_fp8,$fp8_backend,$fp8_recipe,$exit_code,$status,$elapsed_sec,$max_tok,$avg_tok,$final_loss,$min_val_bpb,$peak_vram,$fp8_layers,$log_file" >> "$SUMMARY_CSV"
+    echo "$variant,$use_fp8,$fp8_backend,$fp8_recipe,$exit_code,$status,$elapsed_sec,$max_tok,$avg_tok,$final_loss,$min_val_bpb,$avg_vram,$peak_vram,$fp8_layers,$log_file" >> "$SUMMARY_CSV"
 }
 
 # Run FP8 first so failures (e.g. early NaNs) are visible immediately.

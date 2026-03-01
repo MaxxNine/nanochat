@@ -61,6 +61,20 @@ parser.add_argument("--debug-nan", action="store_true", help="enable non-finite 
 parser.add_argument("--debug-anomaly", action="store_true", help="enable PyTorch autograd anomaly detection (slow)")
 parser.add_argument("--debug-max-nonfinite", type=int, default=8, help="max number of non-finite tensors to print per check")
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging)")
+# Block update schedule (feature-flagged optimization for 1x4090 experiments)
+parser.add_argument("--block-update-schedule", type=str, default="full_update", choices=["full_update", "dynamic_suffix"], help="block training schedule: full_update (default) or dynamic_suffix")
+parser.add_argument("--dyn-warmup-steps", type=int, default=40, help="dynamic_suffix: run full updates for the first N steps")
+parser.add_argument("--dyn-probe-every", type=int, default=20, help="dynamic_suffix: run a full probe step every N steps")
+parser.add_argument("--dyn-refresh-every", type=int, default=80, help="dynamic_suffix: force periodic full refresh every N steps")
+parser.add_argument("--dyn-relevance-metric", type=str, default="grad_ratio", choices=["grad_ratio", "saliency_abs_gp"], help="dynamic_suffix: block relevance metric on probe steps")
+parser.add_argument("--dyn-relevance-threshold", type=float, default=0.9, help="dynamic_suffix: cumulative relevance threshold for selecting active suffix")
+parser.add_argument("--dyn-min-active-layers", type=int, default=4, help="dynamic_suffix: minimum number of active suffix layers")
+parser.add_argument("--dyn-max-active-layers", type=int, default=0, help="dynamic_suffix: maximum number of active suffix layers (0=no cap)")
+parser.add_argument("--dyn-freeze-start-step", type=int, default=-1, help="dynamic_suffix: step where suffix freezing can start (-1 uses fraction)")
+parser.add_argument("--dyn-freeze-start-frac", type=float, default=0.5, help="dynamic_suffix: if freeze-start-step=-1, start freezing at this fraction of run")
+parser.add_argument("--dyn-ema-decay", type=float, default=0.9, help="dynamic_suffix: EMA decay for block relevance")
+parser.add_argument("--dyn-eps", type=float, default=1e-8, help="dynamic_suffix: epsilon for numerical stability in relevance metrics")
+parser.add_argument("--dyn-log-every", type=int, default=20, help="dynamic_suffix: log active suffix/probe info every N steps")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -105,6 +119,7 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+get_cur_memory = torch.cuda.memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
@@ -178,6 +193,11 @@ if resuming:
 
 # -----------------------------------------------------------------------------
 # FP8 training initialization and management (this has to be done before torch.compile)
+
+# Dynamic suffix + custom FP8 is much more stable with graph-safe custom FP8 op.
+if args.fp8 and args.fp8_backend == "custom" and args.block_update_schedule == "dynamic_suffix" and not args.fp8_no_allow_in_graph:
+    print0("WARNING: enabling --fp8-no-allow-in-graph for dynamic_suffix + custom FP8 stability")
+    args.fp8_no_allow_in_graph = True
 
 # Convert Linear layers to Float8Linear if --fp8 is set
 if args.fp8:
@@ -307,10 +327,45 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
+compiled_suffix_fns = {}
+compiled_suffix_failed = set()
 if args.no_compile:
     print0("DEBUG: torch.compile disabled (--no-compile)")
 else:
     model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+    compiled_suffix_fns[0] = model
+
+
+def get_or_compile_suffix_fn(active_start: int):
+    """Return a compiled forward for a fixed active_start, or None if it should run eager."""
+    if args.no_compile:
+        return None
+    active_start = int(active_start)
+    if active_start in compiled_suffix_fns:
+        return compiled_suffix_fns[active_start]
+    if active_start in compiled_suffix_failed:
+        return None
+
+    def suffix_forward(idx, targets, _active_start=active_start):
+        return orig_model(idx, targets, active_start=_active_start)
+
+    try:
+        compiled_fn = torch.compile(suffix_forward, dynamic=False)
+        compiled_suffix_fns[active_start] = compiled_fn
+        if active_start > 0:
+            n_layers = len(orig_model.transformer.h)
+            print0(
+                f"dynamic_suffix compile cache: active_start={active_start} "
+                f"(active_layers={n_layers - active_start}/{n_layers})"
+            )
+        return compiled_fn
+    except Exception as e:
+        compiled_suffix_failed.add(active_start)
+        print0(
+            f"WARNING: failed to compile dynamic suffix active_start={active_start}; "
+            f"falling back to eager. error={type(e).__name__}: {e}"
+        )
+        return None
 
 
 def debug_list_nonfinite_grads(model, max_items=8):
@@ -338,6 +393,62 @@ def debug_list_nonfinite_params(model, max_items=8):
             if len(findings) >= max_items:
                 break
     return findings
+
+
+def choose_active_start_from_scores(scores, threshold, min_active_layers, max_active_layers):
+    n = len(scores)
+    min_active_layers = max(1, min(min_active_layers, n))
+    if max_active_layers <= 0:
+        max_active = n
+    else:
+        max_active = max(1, min(max_active_layers, n))
+    if max_active < min_active_layers:
+        max_active = min_active_layers
+
+    total = float(sum(scores))
+    if total <= 0:
+        return n - max_active
+
+    target = float(threshold) * total
+    running = 0.0
+    active_start = n - max_active
+    for i in range(n - 1, -1, -1):
+        running += float(scores[i])
+        active_layers = n - i
+        if running >= target and min_active_layers <= active_layers <= max_active:
+            active_start = i
+            break
+        if active_layers > max_active:
+            break
+    # Respect min/max active constraints.
+    active_start = min(active_start, n - min_active_layers)
+    active_start = max(active_start, n - max_active)
+    return max(0, int(active_start))
+
+
+def block_relevance_scores(model, metric="grad_ratio", eps=1e-8):
+    scores = []
+    blocks = model.transformer.h
+    for block in blocks:
+        if metric == "grad_ratio":
+            g2, w2 = 0.0, 0.0
+            for p in block.parameters():
+                if p.grad is not None:
+                    g2 += p.grad.float().pow(2).sum().item()
+                w2 += p.data.float().pow(2).sum().item()
+            g = math.sqrt(max(g2, 0.0))
+            w = math.sqrt(max(w2, 0.0))
+            scores.append(g / (w + eps))
+        elif metric == "saliency_abs_gp":
+            saliency = 0.0
+            for p in block.parameters():
+                if p.grad is None:
+                    continue
+                saliency += (p.grad.float() * p.data.float()).abs().sum().item()
+            scores.append(saliency)
+        else:
+            raise ValueError(f"Unknown dynamic_suffix relevance metric: {metric}")
+    return scores
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -477,6 +588,11 @@ if not resuming:
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     total_training_time = 0 # total wall-clock time of training
+    memory_usage_sum = 0.0
+    memory_usage_count = 0
+    step_peak_memory_sum = 0.0
+    step_peak_memory_count = 0
+    global_peak_memory_bytes = 0.0
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -484,6 +600,11 @@ else:
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
+    memory_usage_sum = loop_state.get("memory_usage_sum", 0.0)
+    memory_usage_count = loop_state.get("memory_usage_count", 0)
+    step_peak_memory_sum = loop_state.get("step_peak_memory_sum", 0.0)
+    step_peak_memory_count = loop_state.get("step_peak_memory_count", 0)
+    global_peak_memory_bytes = loop_state.get("global_peak_memory_bytes", 0.0)
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -493,6 +614,43 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+
+# -----------------------------------------------------------------------------
+# Optional dynamic suffix block-update schedule (feature-flagged)
+dynamic_suffix_enabled = args.block_update_schedule == "dynamic_suffix"
+if dynamic_suffix_enabled:
+    if ddp_world_size != 1:
+        raise ValueError("dynamic_suffix currently supports single-rank runs only (set nproc_per_node=1).")
+    num_blocks = len(orig_model.transformer.h)
+    dyn_min_active = max(1, min(args.dyn_min_active_layers, num_blocks))
+    dyn_max_active_cap = num_blocks if args.dyn_max_active_layers <= 0 else max(1, min(args.dyn_max_active_layers, num_blocks))
+    if dyn_max_active_cap < dyn_min_active:
+        dyn_max_active_cap = dyn_min_active
+    dyn_relevance_ema = [0.0 for _ in range(num_blocks)]
+    dyn_active_start = max(0, num_blocks - dyn_max_active_cap)
+    dyn_probe_steps = 0
+    dyn_active_layers_hist = []
+    if args.dyn_freeze_start_step >= 0:
+        dyn_freeze_start_step = max(0, args.dyn_freeze_start_step)
+    else:
+        dyn_freeze_start_step = max(0, int(round(args.dyn_freeze_start_frac * num_iterations)))
+    print0(
+        f"Dynamic suffix enabled: blocks={num_blocks}, min_active={dyn_min_active}, "
+        f"max_active={dyn_max_active_cap}, threshold={args.dyn_relevance_threshold:.3f}, "
+        f"warmup={args.dyn_warmup_steps}, probe_every={args.dyn_probe_every}, "
+        f"refresh_every={args.dyn_refresh_every}, freeze_start_step={dyn_freeze_start_step}"
+    )
+    if not args.no_compile:
+        print0("NOTE: dynamic_suffix compile mode caches compiled graphs per active_start; eager is fallback on compile failures.")
+else:
+    num_blocks = 0
+    dyn_min_active = 0
+    dyn_max_active_cap = 0
+    dyn_relevance_ema = []
+    dyn_active_start = 0
+    dyn_probe_steps = 0
+    dyn_active_layers_hist = []
+    dyn_freeze_start_step = 0
 
 # Go!
 while True:
@@ -577,6 +735,11 @@ while True:
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
+                    "memory_usage_sum": memory_usage_sum,
+                    "memory_usage_count": memory_usage_count,
+                    "step_peak_memory_sum": step_peak_memory_sum,
+                    "step_peak_memory_count": step_peak_memory_count,
+                    "global_peak_memory_bytes": global_peak_memory_bytes,
                 },
             },
             rank=ddp_rank,
@@ -589,11 +752,48 @@ while True:
     # -------------------------------------------------------------------------
     # single training step
     # evaluate the gradient
+    if device_type == "cuda":
+        # Reset peak tracker so we can capture true per-step peak (forward/backward/optimizer).
+        torch.cuda.reset_peak_memory_stats()
     synchronize()
     t0 = time.time()
+    step_is_probe = False
+    active_start_this_step = 0
+    if dynamic_suffix_enabled:
+        is_warmup = step < args.dyn_warmup_steps
+        is_periodic_probe = args.dyn_probe_every > 0 and step % args.dyn_probe_every == 0
+        is_refresh = args.dyn_refresh_every > 0 and step % args.dyn_refresh_every == 0
+        freeze_enabled = step >= dyn_freeze_start_step
+        step_is_probe = is_warmup or is_periodic_probe or is_refresh or (not freeze_enabled)
+        active_start_this_step = 0 if step_is_probe else dyn_active_start
+        active_layers_this_step = num_blocks - active_start_this_step
+        dyn_active_layers_hist.append(active_layers_this_step)
+    else:
+        active_layers_this_step = None
+
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            if dynamic_suffix_enabled:
+                # Compile-aware dynamic suffix path:
+                # - active_start=0 uses the base compiled model
+                # - active_start>0 uses cached compiled forward specialized to that suffix
+                # - eager is only used as fallback if compilation for that active_start fails
+                compiled_fn = get_or_compile_suffix_fn(active_start_this_step)
+                if compiled_fn is not None:
+                    try:
+                        loss = compiled_fn(x, y)
+                    except Exception as e:
+                        compiled_suffix_failed.add(int(active_start_this_step))
+                        print0(
+                            f"WARNING: dynamic suffix compiled forward failed at active_start={active_start_this_step}; "
+                            f"falling back to eager for this active_start. error={type(e).__name__}: {e}"
+                        )
+                        loss = orig_model(x, y, active_start=active_start_this_step)
+                else:
+                    loss = orig_model(x, y, active_start=active_start_this_step)
+            else:
+                # Preserve the original full-update call path.
+                loss = model(x, y)
         if args.debug_nan:
             loss_det = loss.detach()
             if not torch.isfinite(loss_det):
@@ -619,6 +819,30 @@ while True:
                     print0(f"  grad {name}: dtype={dtype} shape={shape} bad={num_bad}")
                 raise RuntimeError("Non-finite gradients detected")
         x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+
+    if dynamic_suffix_enabled and step_is_probe:
+        scores = block_relevance_scores(orig_model, metric=args.dyn_relevance_metric, eps=args.dyn_eps)
+        if ddp_world_size > 1 and torch.distributed.is_initialized():
+            score_t = torch.tensor(scores, dtype=torch.float32, device=device)
+            torch.distributed.all_reduce(score_t, op=torch.distributed.ReduceOp.SUM)
+            score_t /= ddp_world_size
+            scores = score_t.tolist()
+
+        for i, s in enumerate(scores):
+            dyn_relevance_ema[i] = args.dyn_ema_decay * dyn_relevance_ema[i] + (1 - args.dyn_ema_decay) * float(s)
+        dyn_active_start = choose_active_start_from_scores(
+            dyn_relevance_ema,
+            threshold=args.dyn_relevance_threshold,
+            min_active_layers=dyn_min_active,
+            max_active_layers=dyn_max_active_cap,
+        )
+        dyn_probe_steps += 1
+        if (step % max(1, args.dyn_log_every) == 0) or (step < 5):
+            print0(
+                f"dynamic_suffix probe step={step} | next_active_layers={num_blocks - dyn_active_start}/{num_blocks} "
+                f"| freeze_start_step={dyn_freeze_start_step}"
+            )
+
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -641,6 +865,14 @@ while True:
     synchronize()
     t1 = time.time()
     dt = t1 - t0
+    cur_memory_bytes = get_cur_memory()
+    if device_type == "cuda":
+        step_peak_memory_bytes = get_max_memory()
+        global_peak_memory_bytes = max(global_peak_memory_bytes, float(step_peak_memory_bytes))
+        memory_usage_sum += cur_memory_bytes
+        memory_usage_count += 1
+        step_peak_memory_sum += step_peak_memory_bytes
+        step_peak_memory_count += 1
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -663,7 +895,11 @@ while True:
     else:
         eta_str = ""
     epoch = dataloader_state_dict["epoch"]
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    dyn_suffix_str = ""
+    if dynamic_suffix_enabled:
+        probe_mark = "P" if step_is_probe else "S"
+        dyn_suffix_str = f" | active_layers: {active_layers_this_step}/{num_blocks} ({probe_mark})"
+    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch}{dyn_suffix_str} | total time: {total_training_time/60:.2f}m{eta_str}")
     if step % 100 == 0:
         log_data = {
             "step": step,
@@ -676,6 +912,13 @@ while True:
             "train/mfu": mfu,
             "train/epoch": epoch,
         }
+        if device_type == "cuda":
+            log_data["train/memory_mib"] = cur_memory_bytes / 1024 / 1024
+            log_data["train/step_peak_memory_mib"] = step_peak_memory_bytes / 1024 / 1024
+        if dynamic_suffix_enabled:
+            log_data["train/dyn_active_layers"] = active_layers_this_step
+            log_data["train/dyn_probe_step"] = int(step_is_probe)
+            log_data["train/dyn_probe_count"] = dyn_probe_steps
         wandb_run.log(log_data)
 
     # state update
@@ -693,10 +936,28 @@ while True:
         gc.collect() # manually collect, just to be safe for very, very long runs
 
 # print a few more stats
-print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
+if device_type == "cuda":
+    peak_memory_mib = global_peak_memory_bytes / 1024 / 1024
+else:
+    peak_memory_mib = get_max_memory() / 1024 / 1024
+print0(f"Peak memory usage: {peak_memory_mib:.2f}MiB")
+if device_type == "cuda" and memory_usage_count > 0:
+    avg_memory_mib = (memory_usage_sum / memory_usage_count) / 1024 / 1024
+    print0(f"Average memory usage: {avg_memory_mib:.2f}MiB")
+if device_type == "cuda" and step_peak_memory_count > 0:
+    avg_step_peak_memory_mib = (step_peak_memory_sum / step_peak_memory_count) / 1024 / 1024
+    print0(f"Average step peak memory usage: {avg_step_peak_memory_mib:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+if dynamic_suffix_enabled and dyn_active_layers_hist:
+    active_min = min(dyn_active_layers_hist)
+    active_max = max(dyn_active_layers_hist)
+    active_mean = sum(dyn_active_layers_hist) / len(dyn_active_layers_hist)
+    print0(
+        f"Dynamic suffix summary: probe_steps={dyn_probe_steps}, active_layers_mean={active_mean:.2f}, "
+        f"active_layers_range=[{active_min},{active_max}]"
+    )
 
 # Log to report
 from nanochat.report import get_report
@@ -720,7 +981,7 @@ get_report().log(section="Base model training", data=[
         "MFU %": f"{mfu:.2f}%",
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
-        "Peak memory usage": f"{get_max_memory() / 1024 / 1024:.2f}MiB",
+        "Peak memory usage": f"{peak_memory_mib:.2f}MiB",
     }
 ])
 
