@@ -143,6 +143,173 @@ class Block(nn.Module):
         return x
 
 
+_REDUCTION_NONE = 0
+_REDUCTION_SUM = 1
+_REDUCTION_MEAN = 2
+
+
+def _chunked_lse_softcapped(h32, w32, softcap, chunk_size):
+    """Compute per-row logsumexp of softcapped logits without materializing full vocab."""
+    n = h32.size(0)
+    m = torch.full((n,), float("-inf"), dtype=torch.float32, device=h32.device)
+    s = torch.zeros((n,), dtype=torch.float32, device=h32.device)
+    vocab = w32.size(0)
+    for start in range(0, vocab, chunk_size):
+        end = min(start + chunk_size, vocab)
+        a_chunk = h32 @ w32[start:end].t()
+        z_chunk = softcap * torch.tanh(a_chunk / softcap)
+        chunk_max = z_chunk.max(dim=1).values
+        new_m = torch.maximum(m, chunk_max)
+        s = torch.exp(m - new_m) * s + torch.exp(z_chunk - new_m[:, None]).sum(dim=1)
+        m = new_m
+    return m + torch.log(s)
+
+
+class _ChunkedLinearCrossEntropy(torch.autograd.Function):
+    """
+    Exact CE over full vocab with chunked logits + recompute in backward.
+    Saves activation memory by avoiding full (N, V) logits materialization.
+    """
+
+    @staticmethod
+    def forward(ctx, h, weight, targets, softcap, chunk_size, reduction_code):
+        if h.ndim != 2:
+            raise ValueError(f"h must be 2D [N, D], got shape={tuple(h.shape)}")
+        if weight.ndim != 2:
+            raise ValueError(f"weight must be 2D [V, D], got shape={tuple(weight.shape)}")
+        if targets.ndim != 1:
+            raise ValueError(f"targets must be 1D [N], got shape={tuple(targets.shape)}")
+        if h.size(0) != targets.size(0):
+            raise ValueError(f"h/targets size mismatch: N={h.size(0)} vs {targets.size(0)}")
+        if h.size(1) != weight.size(1):
+            raise ValueError(f"h/weight dim mismatch: D={h.size(1)} vs {weight.size(1)}")
+
+        softcap = float(softcap)
+        chunk_size = int(chunk_size)
+        reduction_code = int(reduction_code)
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be > 0, got {chunk_size}")
+
+        h32 = h.float()
+        w32 = weight.float()
+        y = targets.to(torch.long)
+        valid = y >= 0
+        y_safe = torch.where(valid, y, torch.zeros_like(y))
+
+        lse = _chunked_lse_softcapped(h32, w32, softcap, chunk_size)
+        target_z = torch.zeros_like(lse)
+        if valid.any():
+            h_valid = h32[valid]
+            w_target = w32.index_select(0, y_safe[valid])
+            a_t = (h_valid * w_target).sum(dim=1)
+            target_z[valid] = softcap * torch.tanh(a_t / softcap)
+
+        loss_flat = torch.where(valid, lse - target_z, torch.zeros_like(lse))
+        valid_count = int(valid.sum().item())
+
+        ctx.save_for_backward(h, weight, y)
+        ctx.softcap = softcap
+        ctx.chunk_size = chunk_size
+        ctx.reduction_code = reduction_code
+        ctx.valid_count = valid_count
+
+        if reduction_code == _REDUCTION_NONE:
+            return loss_flat
+        if reduction_code == _REDUCTION_SUM:
+            return loss_flat.sum()
+        if reduction_code == _REDUCTION_MEAN:
+            if valid_count == 0:
+                return torch.full((), float("nan"), dtype=torch.float32, device=h.device)
+            return loss_flat.sum() / valid_count
+        raise ValueError(f"Unknown reduction_code={reduction_code}")
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        h, weight, targets = ctx.saved_tensors
+        softcap = ctx.softcap
+        chunk_size = ctx.chunk_size
+        reduction_code = ctx.reduction_code
+        valid_count = ctx.valid_count
+
+        needs_h = ctx.needs_input_grad[0]
+        needs_w = ctx.needs_input_grad[1]
+        if (not needs_h) and (not needs_w):
+            return None, None, None, None, None, None
+
+        h32 = h.float()
+        w32 = weight.float()
+        y = targets
+        valid = y >= 0
+        y_safe = torch.where(valid, y, torch.zeros_like(y))
+        n = h32.size(0)
+        vocab = w32.size(0)
+
+        # Upstream scaling per token.
+        if reduction_code == _REDUCTION_NONE:
+            coeff = grad_output.reshape(-1).float()
+        elif reduction_code == _REDUCTION_SUM:
+            coeff = torch.full((n,), float(grad_output.float().item()), dtype=torch.float32, device=h.device)
+        else:  # mean
+            if valid_count == 0:
+                grad_h = torch.zeros_like(h) if needs_h else None
+                grad_w = torch.zeros_like(weight) if needs_w else None
+                return grad_h, grad_w, None, None, None, None
+            scale = grad_output.float() / valid_count
+            coeff = torch.full((n,), float(scale.item()), dtype=torch.float32, device=h.device)
+        coeff = torch.where(valid, coeff, torch.zeros_like(coeff))
+
+        if coeff.abs().max().item() == 0.0:
+            grad_h = torch.zeros_like(h) if needs_h else None
+            grad_w = torch.zeros_like(weight) if needs_w else None
+            return grad_h, grad_w, None, None, None, None
+
+        lse = _chunked_lse_softcapped(h32, w32, softcap, chunk_size)
+
+        grad_h32 = torch.zeros_like(h32) if needs_h else None
+        grad_w32 = torch.zeros_like(w32) if needs_w else None
+
+        for start in range(0, vocab, chunk_size):
+            end = min(start + chunk_size, vocab)
+            w_chunk = w32[start:end]
+            a_chunk = h32 @ w_chunk.t()
+            tanh_u = torch.tanh(a_chunk / softcap)
+            z_chunk = softcap * tanh_u
+
+            p_chunk = torch.exp(z_chunk - lse[:, None])
+            in_chunk = valid & (y_safe >= start) & (y_safe < end)
+            if in_chunk.any():
+                row_idx = torch.nonzero(in_chunk, as_tuple=False).squeeze(1)
+                col_idx = y_safe[in_chunk] - start
+                p_chunk[row_idx, col_idx] -= 1.0
+
+            dz_da = 1.0 - tanh_u.square()
+            g_a = p_chunk * dz_da
+            g_a = g_a * coeff[:, None]
+
+            if needs_h:
+                grad_h32 += g_a @ w_chunk
+            if needs_w:
+                grad_w32[start:end] += g_a.t() @ h32
+
+        grad_h = grad_h32.to(dtype=h.dtype) if needs_h else None
+        grad_w = grad_w32.to(dtype=weight.dtype) if needs_w else None
+        return grad_h, grad_w, None, None, None, None
+
+
+def chunked_linear_cross_entropy(h, weight, targets, softcap=15.0, chunk_size=4096, reduction='mean'):
+    """Exact cross-entropy from hidden states and output weight via vocab-chunked computation."""
+    if reduction == 'none':
+        reduction_code = _REDUCTION_NONE
+    elif reduction == 'sum':
+        reduction_code = _REDUCTION_SUM
+    elif reduction == 'mean':
+        reduction_code = _REDUCTION_MEAN
+    else:
+        raise ValueError(f"Unsupported reduction '{reduction}'")
+    out = _ChunkedLinearCrossEntropy.apply(h, weight, targets, float(softcap), int(chunk_size), int(reduction_code))
+    return out
+
+
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -184,6 +351,9 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+        # LM-head CE backend: baseline full-logits (default) or chunked exact CE.
+        self.lm_ce_backend = "baseline"
+        self.lm_ce_chunk_size = 4096
 
     @torch.no_grad()
     def init_weights(self):
@@ -289,6 +459,16 @@ class GPT(nn.Module):
     def get_device(self):
         return self.transformer.wte.weight.device
 
+    def configure_lm_ce(self, backend="baseline", chunk_size=4096):
+        backend = str(backend).lower()
+        if backend not in {"baseline", "chunked"}:
+            raise ValueError(f"Unknown lm_ce backend '{backend}'. Use baseline|chunked.")
+        chunk_size = int(chunk_size)
+        if chunk_size <= 0:
+            raise ValueError(f"lm_ce_chunk_size must be > 0, got {chunk_size}")
+        self.lm_ce_backend = backend
+        self.lm_ce_chunk_size = chunk_size
+
     def estimate_flops(self):
         """
         Return the estimated FLOPs per token for the model (forward + backward).
@@ -345,7 +525,17 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(
+        self,
+        unembedding_lr=0.004,
+        embedding_lr=0.2,
+        matrix_lr=0.02,
+        weight_decay=0.0,
+        adam_betas=(0.8, 0.95),
+        scalar_lr=0.5,
+        muon_active_only_stack=False,
+        muon_stack_chunk_size=0,
+    ):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -377,6 +567,8 @@ class GPT(nn.Module):
             param_groups.append(dict(
                 kind='muon', params=group_params, lr=matrix_lr,
                 momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                active_only_stack=bool(muon_active_only_stack),
+                stack_chunk_size=int(muon_stack_chunk_size),
             ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
@@ -426,20 +618,33 @@ class GPT(nn.Module):
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
-
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
+            # Training: optionally use exact chunked CE to avoid full (B,T,V) logits materialization.
+            if self.lm_ce_backend == "chunked":
+                h = x.view(-1, x.size(-1))
+                y = targets.view(-1)
+                w = self.lm_head.weight[:self.config.vocab_size]
+                loss = chunked_linear_cross_entropy(
+                    h, w, y,
+                    softcap=softcap,
+                    chunk_size=self.lm_ce_chunk_size,
+                    reduction=loss_reduction,
+                )
+                return loss
+            # Baseline full-logits CE path.
+            logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+            logits = logits[..., :self.config.vocab_size] # slice to remove padding
+            logits = logits.float() # switch to fp32 for logit softcap and loss computation
+            logits = softcap * torch.tanh(logits / softcap) # squash the logits
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
             # inference: just return the logits directly
+            logits = self.lm_head(x)
+            logits = logits[..., :self.config.vocab_size]
+            logits = logits.float()
+            logits = softcap * torch.tanh(logits / softcap)
             return logits
 
     @torch.inference_mode()

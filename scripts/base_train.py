@@ -62,6 +62,9 @@ parser.add_argument("--debug-anomaly", action="store_true", help="enable PyTorch
 parser.add_argument("--debug-max-nonfinite", type=int, default=8, help="max number of non-finite tensors to print per check")
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging)")
 parser.add_argument("--debug-mem-every", type=int, default=0, help="if >0 and CUDA, print memory breakdown every N steps (for peak diagnosis)")
+# LM-head CE backend (feature-flagged memory optimization)
+parser.add_argument("--lm-ce-backend", type=str, default="baseline", choices=["baseline", "chunked"], help="lm_head CE implementation: baseline full-logits or chunked exact CE")
+parser.add_argument("--lm-ce-chunk-size", type=int, default=4096, help="chunk size over vocab for --lm-ce-backend=chunked")
 # Block update schedule (feature-flagged optimization for 1x4090 experiments)
 parser.add_argument("--block-update-schedule", type=str, default="full_update", choices=["full_update", "dynamic_suffix"], help="block training schedule: full_update (default) or dynamic_suffix")
 parser.add_argument("--dyn-warmup-steps", type=int, default=40, help="dynamic_suffix: run full updates for the first N steps")
@@ -96,6 +99,8 @@ parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 for embedding/unembedding")
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
+parser.add_argument("--muon-active-only-stack", action="store_true", help="Muon: stack only active parameters (grad != None) on each step")
+parser.add_argument("--muon-stack-chunk-size", type=int, default=0, help="Muon: max number of params per stacked update chunk (0 = no chunking)")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
@@ -182,6 +187,9 @@ model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
+model.configure_lm_ce(args.lm_ce_backend, args.lm_ce_chunk_size)
+if args.lm_ce_backend == "chunked":
+    print0(f"✓ LM CE backend enabled: chunked (chunk_size={args.lm_ce_chunk_size})")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -522,7 +530,14 @@ optimizer = model.setup_optimizer(
     # Muon hyperparameters
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    muon_active_only_stack=args.muon_active_only_stack,
+    muon_stack_chunk_size=args.muon_stack_chunk_size,
 )
+if args.muon_active_only_stack or args.muon_stack_chunk_size > 0:
+    print0(
+        f"✓ Muon stack flags: active_only_stack={args.muon_active_only_stack}, "
+        f"stack_chunk_size={args.muon_stack_chunk_size}"
+    )
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)
@@ -766,6 +781,14 @@ while True:
     )
     mem_before_alloc = get_cur_memory()
     mem_before_reserved = get_reserved_memory()
+    phase_fwd_peak_bytes = 0.0
+    phase_bwd_peak_bytes = 0.0
+    phase_opt_peak_bytes = 0.0
+    phase_zero_peak_bytes = 0.0
+    if mem_debug_step:
+        # For phase attribution we reset the CUDA peak tracker per phase.
+        # This intentionally sacrifices "whole-step single counter" on debug steps.
+        torch.cuda.reset_peak_memory_stats()
     synchronize()
     t0 = time.time()
     step_is_probe = False
@@ -783,6 +806,8 @@ while True:
         active_layers_this_step = None
 
     for micro_step in range(grad_accum_steps):
+        if mem_debug_step:
+            torch.cuda.reset_peak_memory_stats()
         with autocast_ctx:
             if dynamic_suffix_enabled:
                 # Compile-aware dynamic suffix path:
@@ -805,6 +830,8 @@ while True:
             else:
                 # Preserve the original full-update call path.
                 loss = model(x, y)
+        if mem_debug_step:
+            phase_fwd_peak_bytes = max(phase_fwd_peak_bytes, float(get_max_memory()))
         if args.debug_nan:
             loss_det = loss.detach()
             if not torch.isfinite(loss_det):
@@ -821,7 +848,11 @@ while True:
                 raise RuntimeError("Non-finite forward loss detected")
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        if mem_debug_step:
+            torch.cuda.reset_peak_memory_stats()
         loss.backward()
+        if mem_debug_step:
+            phase_bwd_peak_bytes = max(phase_bwd_peak_bytes, float(get_max_memory()))
         if args.debug_nan:
             bad_grads = debug_list_nonfinite_grads(orig_model, max_items=args.debug_max_nonfinite)
             if bad_grads:
@@ -866,7 +897,11 @@ while True:
         if group['kind'] == 'muon':
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
+    if mem_debug_step:
+        torch.cuda.reset_peak_memory_stats()
     optimizer.step()
+    if mem_debug_step:
+        phase_opt_peak_bytes = float(get_max_memory())
     mem_after_step_alloc = get_cur_memory()
     mem_after_step_reserved = get_reserved_memory()
     if args.debug_nan:
@@ -876,7 +911,11 @@ while True:
             for name, dtype, shape, num_bad in bad_params:
                 print0(f"  param {name}: dtype={dtype} shape={shape} bad={num_bad}")
             raise RuntimeError("Non-finite parameters detected after optimizer step")
+    if mem_debug_step:
+        torch.cuda.reset_peak_memory_stats()
     model.zero_grad(set_to_none=True)
+    if mem_debug_step:
+        phase_zero_peak_bytes = float(get_max_memory())
     mem_after_zero_alloc = get_cur_memory()
     mem_after_zero_reserved = get_reserved_memory()
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
@@ -885,7 +924,15 @@ while True:
     dt = t1 - t0
     cur_memory_bytes = get_cur_memory()
     if device_type == "cuda":
-        step_peak_memory_bytes = get_max_memory()
+        if mem_debug_step:
+            step_peak_memory_bytes = max(
+                phase_fwd_peak_bytes,
+                phase_bwd_peak_bytes,
+                phase_opt_peak_bytes,
+                phase_zero_peak_bytes,
+            )
+        else:
+            step_peak_memory_bytes = get_max_memory()
         if float(step_peak_memory_bytes) > global_peak_memory_bytes:
             global_peak_memory_bytes = float(step_peak_memory_bytes)
             global_peak_memory_step = step
@@ -907,6 +954,11 @@ while True:
                 f"{mem_after_bwd_reserved/1024/1024:.2f}/"
                 f"{mem_after_step_reserved/1024/1024:.2f}/"
                 f"{mem_after_zero_reserved/1024/1024:.2f}) "
+                f"phase_peak_alloc_mib(fwd/bwd/opt/zero)=("
+                f"{phase_fwd_peak_bytes/1024/1024:.2f}/"
+                f"{phase_bwd_peak_bytes/1024/1024:.2f}/"
+                f"{phase_opt_peak_bytes/1024/1024:.2f}/"
+                f"{phase_zero_peak_bytes/1024/1024:.2f}) "
                 f"step_peak_alloc_mib={step_peak_memory_bytes/1024/1024:.2f} "
                 f"step_peak_reserved_mib={get_max_reserved_memory()/1024/1024:.2f}"
             )

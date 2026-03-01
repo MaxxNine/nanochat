@@ -102,6 +102,12 @@ SAVE_EVERY="${SAVE_EVERY:--1}"
 USE_FP8="${USE_FP8:-1}"
 FP8_BACKEND="${FP8_BACKEND:-custom}"      # custom|torchao
 FP8_RECIPE="${FP8_RECIPE:-tensorwise}"    # tensorwise|rowwise (rowwise requires torchao)
+# LM-head CE backend flags
+LM_CE_BACKEND="${LM_CE_BACKEND:-baseline}"   # baseline|chunked
+LM_CE_CHUNK_SIZE="${LM_CE_CHUNK_SIZE:-4096}"
+# Muon stack flags
+MUON_ACTIVE_ONLY_STACK="${MUON_ACTIVE_ONLY_STACK:-1}"   # 0|1
+MUON_STACK_CHUNK_SIZE="${MUON_STACK_CHUNK_SIZE:-4}"     # 0 disables chunking
 
 # Dynamic suffix feature flags
 BLOCK_UPDATE_SCHEDULE="${BLOCK_UPDATE_SCHEDULE:-dynamic_suffix}"  # full_update|dynamic_suffix
@@ -140,6 +146,9 @@ BASE_TRAIN_ARGS=(
     "--save-every=$SAVE_EVERY"
     "--run=$RUN_NAME"
     "--model-tag=$MODEL_TAG"
+    "--lm-ce-backend=$LM_CE_BACKEND"
+    "--lm-ce-chunk-size=$LM_CE_CHUNK_SIZE"
+    "--muon-stack-chunk-size=$MUON_STACK_CHUNK_SIZE"
     "--block-update-schedule=$BLOCK_UPDATE_SCHEDULE"
     "--dyn-warmup-steps=$DYN_WARMUP_STEPS"
     "--dyn-probe-every=$DYN_PROBE_EVERY"
@@ -163,6 +172,10 @@ if [ "$USE_FP8" = "1" ]; then
     )
 fi
 
+if [ "$MUON_ACTIVE_ONLY_STACK" = "1" ]; then
+    BASE_TRAIN_ARGS+=("--muon-active-only-stack")
+fi
+
 if [ "$DEBUG_MEM_EVERY" -gt 0 ]; then
     BASE_TRAIN_ARGS+=("--debug-mem-every=$DEBUG_MEM_EVERY")
 fi
@@ -184,6 +197,8 @@ fi
 
 echo "=== speedrun_small config ==="
 echo "run=$RUN_NAME model_tag=$MODEL_TAG nproc=$NPROC_PER_NODE max_restarts=$TORCHRUN_MAX_RESTARTS depth=$DEPTH seq=$MAX_SEQ_LEN dbs=$DEVICE_BATCH_SIZE tbs=$TOTAL_BATCH_SIZE steps=$NUM_ITERATIONS fp8=$USE_FP8 backend=$FP8_BACKEND recipe=$FP8_RECIPE schedule=$BLOCK_UPDATE_SCHEDULE"
+echo "lm_ce: backend=$LM_CE_BACKEND chunk_size=$LM_CE_CHUNK_SIZE"
+echo "muon: active_only_stack=$MUON_ACTIVE_ONLY_STACK stack_chunk_size=$MUON_STACK_CHUNK_SIZE"
 echo "dynamic: warmup=$DYN_WARMUP_STEPS probe_every=$DYN_PROBE_EVERY refresh_every=$DYN_REFRESH_EVERY min_active=$DYN_MIN_ACTIVE_LAYERS max_active=$DYN_MAX_ACTIVE_LAYERS freeze_start_step=$DYN_FREEZE_START_STEP freeze_start_frac=$DYN_FREEZE_START_FRAC threshold=$DYN_RELEVANCE_THRESHOLD"
 if [ "$DEBUG_MEM_EVERY" -gt 0 ]; then
     echo "memory-debug: every=$DEBUG_MEM_EVERY steps"
