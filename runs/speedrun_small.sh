@@ -80,9 +80,10 @@ fi
 
 # Training config (defaults tuned for quick local iteration)
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+TORCHRUN_MAX_RESTARTS="${TORCHRUN_MAX_RESTARTS:-0}"
 RUN_NAME="${RUN_NAME:-dummy}"          # "dummy" disables wandb logging
 MODEL_TAG="${MODEL_TAG:-small_baseline}"
-DEPTH="${DEPTH:-18}"
+DEPTH="${DEPTH:-22}"
 WINDOW_PATTERN="${WINDOW_PATTERN:-L}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
 DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-2}"
@@ -116,10 +117,11 @@ if [ "$DEFAULT_DYN_MAX_ACTIVE_LAYERS" -lt 1 ]; then
 fi
 DYN_MAX_ACTIVE_LAYERS="${DYN_MAX_ACTIVE_LAYERS:-$DEFAULT_DYN_MAX_ACTIVE_LAYERS}"
 DYN_FREEZE_START_STEP="${DYN_FREEZE_START_STEP:--1}"
-DYN_FREEZE_START_FRAC="${DYN_FREEZE_START_FRAC:-0.5}"
+DYN_FREEZE_START_FRAC="${DYN_FREEZE_START_FRAC:-0.15}"
 DYN_EMA_DECAY="${DYN_EMA_DECAY:-0.9}"
 DYN_EPS="${DYN_EPS:-1e-8}"
 DYN_LOG_EVERY="${DYN_LOG_EVERY:-20}"
+DEBUG_MEM_EVERY="${DEBUG_MEM_EVERY:-0}"
 
 BASE_TRAIN_ARGS=(
     "--depth=$DEPTH"
@@ -161,6 +163,10 @@ if [ "$USE_FP8" = "1" ]; then
     )
 fi
 
+if [ "$DEBUG_MEM_EVERY" -gt 0 ]; then
+    BASE_TRAIN_ARGS+=("--debug-mem-every=$DEBUG_MEM_EVERY")
+fi
+
 # Stability-first fallback for the hardest combo (dynamic suffix + custom FP8).
 FP8_DYNAMIC_SAFE_ARGS="${FP8_DYNAMIC_SAFE_ARGS:---fp8-skip-lm-head --fp8-skip-attn-qk --fp8-min-dim=256 --fp8-no-allow-in-graph}"
 if [ "$USE_FP8" = "1" ] && [ "$FP8_BACKEND" = "custom" ] && [ "$BLOCK_UPDATE_SCHEDULE" = "dynamic_suffix" ] && [ "${FP8_DYNAMIC_AUTO_SAFE:-1}" = "1" ]; then
@@ -177,11 +183,16 @@ if [ -n "${BASE_TRAIN_EXTRA_ARGS:-}" ]; then
 fi
 
 echo "=== speedrun_small config ==="
-echo "run=$RUN_NAME model_tag=$MODEL_TAG nproc=$NPROC_PER_NODE depth=$DEPTH seq=$MAX_SEQ_LEN dbs=$DEVICE_BATCH_SIZE tbs=$TOTAL_BATCH_SIZE steps=$NUM_ITERATIONS fp8=$USE_FP8 backend=$FP8_BACKEND recipe=$FP8_RECIPE schedule=$BLOCK_UPDATE_SCHEDULE"
+echo "run=$RUN_NAME model_tag=$MODEL_TAG nproc=$NPROC_PER_NODE max_restarts=$TORCHRUN_MAX_RESTARTS depth=$DEPTH seq=$MAX_SEQ_LEN dbs=$DEVICE_BATCH_SIZE tbs=$TOTAL_BATCH_SIZE steps=$NUM_ITERATIONS fp8=$USE_FP8 backend=$FP8_BACKEND recipe=$FP8_RECIPE schedule=$BLOCK_UPDATE_SCHEDULE"
+echo "dynamic: warmup=$DYN_WARMUP_STEPS probe_every=$DYN_PROBE_EVERY refresh_every=$DYN_REFRESH_EVERY min_active=$DYN_MIN_ACTIVE_LAYERS max_active=$DYN_MAX_ACTIVE_LAYERS freeze_start_step=$DYN_FREEZE_START_STEP freeze_start_frac=$DYN_FREEZE_START_FRAC threshold=$DYN_RELEVANCE_THRESHOLD"
+if [ "$DEBUG_MEM_EVERY" -gt 0 ]; then
+    echo "memory-debug: every=$DEBUG_MEM_EVERY steps"
+fi
 
 TORCHRUN_CMD=(
     torchrun
     --standalone
+    --max-restarts="$TORCHRUN_MAX_RESTARTS"
     --nproc_per_node="$NPROC_PER_NODE"
     -m scripts.base_train
     --

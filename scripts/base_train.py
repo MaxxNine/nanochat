@@ -61,6 +61,7 @@ parser.add_argument("--debug-nan", action="store_true", help="enable non-finite 
 parser.add_argument("--debug-anomaly", action="store_true", help="enable PyTorch autograd anomaly detection (slow)")
 parser.add_argument("--debug-max-nonfinite", type=int, default=8, help="max number of non-finite tensors to print per check")
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging)")
+parser.add_argument("--debug-mem-every", type=int, default=0, help="if >0 and CUDA, print memory breakdown every N steps (for peak diagnosis)")
 # Block update schedule (feature-flagged optimization for 1x4090 experiments)
 parser.add_argument("--block-update-schedule", type=str, default="full_update", choices=["full_update", "dynamic_suffix"], help="block training schedule: full_update (default) or dynamic_suffix")
 parser.add_argument("--dyn-warmup-steps", type=int, default=40, help="dynamic_suffix: run full updates for the first N steps")
@@ -120,6 +121,8 @@ autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 get_cur_memory = torch.cuda.memory_allocated if device_type == "cuda" else lambda: 0
+get_reserved_memory = torch.cuda.memory_reserved if device_type == "cuda" else lambda: 0
+get_max_reserved_memory = torch.cuda.max_memory_reserved if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
@@ -593,6 +596,7 @@ if not resuming:
     step_peak_memory_sum = 0.0
     step_peak_memory_count = 0
     global_peak_memory_bytes = 0.0
+    global_peak_memory_step = -1
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -605,6 +609,7 @@ else:
     step_peak_memory_sum = loop_state.get("step_peak_memory_sum", 0.0)
     step_peak_memory_count = loop_state.get("step_peak_memory_count", 0)
     global_peak_memory_bytes = loop_state.get("global_peak_memory_bytes", 0.0)
+    global_peak_memory_step = loop_state.get("global_peak_memory_step", -1)
 
 # Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
 tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
@@ -740,6 +745,7 @@ while True:
                     "step_peak_memory_sum": step_peak_memory_sum,
                     "step_peak_memory_count": step_peak_memory_count,
                     "global_peak_memory_bytes": global_peak_memory_bytes,
+                    "global_peak_memory_step": global_peak_memory_step,
                 },
             },
             rank=ddp_rank,
@@ -755,6 +761,11 @@ while True:
     if device_type == "cuda":
         # Reset peak tracker so we can capture true per-step peak (forward/backward/optimizer).
         torch.cuda.reset_peak_memory_stats()
+    mem_debug_step = device_type == "cuda" and args.debug_mem_every > 0 and (
+        step < 5 or (step % max(1, args.debug_mem_every) == 0)
+    )
+    mem_before_alloc = get_cur_memory()
+    mem_before_reserved = get_reserved_memory()
     synchronize()
     t0 = time.time()
     step_is_probe = False
@@ -843,6 +854,9 @@ while True:
                 f"| freeze_start_step={dyn_freeze_start_step}"
             )
 
+    mem_after_bwd_alloc = get_cur_memory()
+    mem_after_bwd_reserved = get_reserved_memory()
+
     # step the optimizer
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
@@ -853,6 +867,8 @@ while True:
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     optimizer.step()
+    mem_after_step_alloc = get_cur_memory()
+    mem_after_step_reserved = get_reserved_memory()
     if args.debug_nan:
         bad_params = debug_list_nonfinite_params(orig_model, max_items=args.debug_max_nonfinite)
         if bad_params:
@@ -861,6 +877,8 @@ while True:
                 print0(f"  param {name}: dtype={dtype} shape={shape} bad={num_bad}")
             raise RuntimeError("Non-finite parameters detected after optimizer step")
     model.zero_grad(set_to_none=True)
+    mem_after_zero_alloc = get_cur_memory()
+    mem_after_zero_reserved = get_reserved_memory()
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
     t1 = time.time()
@@ -868,11 +886,30 @@ while True:
     cur_memory_bytes = get_cur_memory()
     if device_type == "cuda":
         step_peak_memory_bytes = get_max_memory()
-        global_peak_memory_bytes = max(global_peak_memory_bytes, float(step_peak_memory_bytes))
+        if float(step_peak_memory_bytes) > global_peak_memory_bytes:
+            global_peak_memory_bytes = float(step_peak_memory_bytes)
+            global_peak_memory_step = step
         memory_usage_sum += cur_memory_bytes
         memory_usage_count += 1
         step_peak_memory_sum += step_peak_memory_bytes
         step_peak_memory_count += 1
+        if mem_debug_step:
+            print0(
+                "MEM_DEBUG "
+                f"step={step} "
+                f"alloc_mib(before/bwd/step/zero)=("
+                f"{mem_before_alloc/1024/1024:.2f}/"
+                f"{mem_after_bwd_alloc/1024/1024:.2f}/"
+                f"{mem_after_step_alloc/1024/1024:.2f}/"
+                f"{mem_after_zero_alloc/1024/1024:.2f}) "
+                f"reserved_mib(before/bwd/step/zero)=("
+                f"{mem_before_reserved/1024/1024:.2f}/"
+                f"{mem_after_bwd_reserved/1024/1024:.2f}/"
+                f"{mem_after_step_reserved/1024/1024:.2f}/"
+                f"{mem_after_zero_reserved/1024/1024:.2f}) "
+                f"step_peak_alloc_mib={step_peak_memory_bytes/1024/1024:.2f} "
+                f"step_peak_reserved_mib={get_max_reserved_memory()/1024/1024:.2f}"
+            )
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
@@ -941,6 +978,8 @@ if device_type == "cuda":
 else:
     peak_memory_mib = get_max_memory() / 1024 / 1024
 print0(f"Peak memory usage: {peak_memory_mib:.2f}MiB")
+if device_type == "cuda" and global_peak_memory_step >= 0:
+    print0(f"Peak memory step: {global_peak_memory_step}")
 if device_type == "cuda" and memory_usage_count > 0:
     avg_memory_mib = (memory_usage_sum / memory_usage_count) / 1024 / 1024
     print0(f"Average memory usage: {avg_memory_mib:.2f}MiB")
