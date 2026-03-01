@@ -98,9 +98,28 @@ SAMPLE_EVERY="${SAMPLE_EVERY:--1}"
 SAVE_EVERY="${SAVE_EVERY:--1}"
 
 # FP8 feature flags
-USE_FP8="${USE_FP8:-0}"
+USE_FP8="${USE_FP8:-1}"
 FP8_BACKEND="${FP8_BACKEND:-custom}"      # custom|torchao
 FP8_RECIPE="${FP8_RECIPE:-tensorwise}"    # tensorwise|rowwise (rowwise requires torchao)
+
+# Dynamic suffix feature flags
+BLOCK_UPDATE_SCHEDULE="${BLOCK_UPDATE_SCHEDULE:-dynamic_suffix}"  # full_update|dynamic_suffix
+DYN_WARMUP_STEPS="${DYN_WARMUP_STEPS:-40}"
+DYN_PROBE_EVERY="${DYN_PROBE_EVERY:-20}"
+DYN_REFRESH_EVERY="${DYN_REFRESH_EVERY:-80}"
+DYN_RELEVANCE_METRIC="${DYN_RELEVANCE_METRIC:-grad_ratio}"     # grad_ratio|saliency_abs_gp
+DYN_RELEVANCE_THRESHOLD="${DYN_RELEVANCE_THRESHOLD:-0.9}"
+DYN_MIN_ACTIVE_LAYERS="${DYN_MIN_ACTIVE_LAYERS:-4}"
+DEFAULT_DYN_MAX_ACTIVE_LAYERS=$(( DEPTH / 2 ))
+if [ "$DEFAULT_DYN_MAX_ACTIVE_LAYERS" -lt 1 ]; then
+    DEFAULT_DYN_MAX_ACTIVE_LAYERS=1
+fi
+DYN_MAX_ACTIVE_LAYERS="${DYN_MAX_ACTIVE_LAYERS:-$DEFAULT_DYN_MAX_ACTIVE_LAYERS}"
+DYN_FREEZE_START_STEP="${DYN_FREEZE_START_STEP:--1}"
+DYN_FREEZE_START_FRAC="${DYN_FREEZE_START_FRAC:-0.5}"
+DYN_EMA_DECAY="${DYN_EMA_DECAY:-0.9}"
+DYN_EPS="${DYN_EPS:-1e-8}"
+DYN_LOG_EVERY="${DYN_LOG_EVERY:-20}"
 
 BASE_TRAIN_ARGS=(
     "--depth=$DEPTH"
@@ -119,6 +138,19 @@ BASE_TRAIN_ARGS=(
     "--save-every=$SAVE_EVERY"
     "--run=$RUN_NAME"
     "--model-tag=$MODEL_TAG"
+    "--block-update-schedule=$BLOCK_UPDATE_SCHEDULE"
+    "--dyn-warmup-steps=$DYN_WARMUP_STEPS"
+    "--dyn-probe-every=$DYN_PROBE_EVERY"
+    "--dyn-refresh-every=$DYN_REFRESH_EVERY"
+    "--dyn-relevance-metric=$DYN_RELEVANCE_METRIC"
+    "--dyn-relevance-threshold=$DYN_RELEVANCE_THRESHOLD"
+    "--dyn-min-active-layers=$DYN_MIN_ACTIVE_LAYERS"
+    "--dyn-max-active-layers=$DYN_MAX_ACTIVE_LAYERS"
+    "--dyn-freeze-start-step=$DYN_FREEZE_START_STEP"
+    "--dyn-freeze-start-frac=$DYN_FREEZE_START_FRAC"
+    "--dyn-ema-decay=$DYN_EMA_DECAY"
+    "--dyn-eps=$DYN_EPS"
+    "--dyn-log-every=$DYN_LOG_EVERY"
 )
 
 if [ "$USE_FP8" = "1" ]; then
@@ -129,6 +161,14 @@ if [ "$USE_FP8" = "1" ]; then
     )
 fi
 
+# Stability-first fallback for the hardest combo (dynamic suffix + custom FP8).
+FP8_DYNAMIC_SAFE_ARGS="${FP8_DYNAMIC_SAFE_ARGS:---fp8-skip-lm-head --fp8-skip-attn-qk --fp8-min-dim=256 --fp8-no-allow-in-graph}"
+if [ "$USE_FP8" = "1" ] && [ "$FP8_BACKEND" = "custom" ] && [ "$BLOCK_UPDATE_SCHEDULE" = "dynamic_suffix" ] && [ "${FP8_DYNAMIC_AUTO_SAFE:-1}" = "1" ]; then
+    # shellcheck disable=SC2206
+    SAFE_ARGS_ARRAY=($FP8_DYNAMIC_SAFE_ARGS)
+    BASE_TRAIN_ARGS+=("${SAFE_ARGS_ARRAY[@]}")
+fi
+
 # Optional extra args passthrough (space-delimited)
 if [ -n "${BASE_TRAIN_EXTRA_ARGS:-}" ]; then
     # shellcheck disable=SC2206
@@ -137,7 +177,7 @@ if [ -n "${BASE_TRAIN_EXTRA_ARGS:-}" ]; then
 fi
 
 echo "=== speedrun_small config ==="
-echo "run=$RUN_NAME model_tag=$MODEL_TAG nproc=$NPROC_PER_NODE depth=$DEPTH seq=$MAX_SEQ_LEN dbs=$DEVICE_BATCH_SIZE tbs=$TOTAL_BATCH_SIZE steps=$NUM_ITERATIONS fp8=$USE_FP8 backend=$FP8_BACKEND recipe=$FP8_RECIPE"
+echo "run=$RUN_NAME model_tag=$MODEL_TAG nproc=$NPROC_PER_NODE depth=$DEPTH seq=$MAX_SEQ_LEN dbs=$DEVICE_BATCH_SIZE tbs=$TOTAL_BATCH_SIZE steps=$NUM_ITERATIONS fp8=$USE_FP8 backend=$FP8_BACKEND recipe=$FP8_RECIPE schedule=$BLOCK_UPDATE_SCHEDULE"
 
 TORCHRUN_CMD=(
     torchrun
