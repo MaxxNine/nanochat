@@ -24,6 +24,8 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
+# Fused in-place rotary embeddings (Triton kernel with PyTorch fallback)
+from nanochat.rotary import apply_rotary_emb, fused_norm_rotary
 
 @dataclass
 class GPTConfig:
@@ -48,13 +50,7 @@ def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
 
-def apply_rotary_emb(x, cos, sin):
-    assert x.ndim == 4  # multihead attention
-    d = x.shape[3] // 2
-    x1, x2 = x[..., :d], x[..., d:] # split up last dim into two halves
-    y1 = x1 * cos + x2 * sin # rotate pairs of dims
-    y2 = x1 * (-sin) + x2 * cos
-    return torch.cat([y1, y2], 3)
+# apply_rotary_emb is imported from nanochat.rotary (Triton kernel with PyTorch fallback)
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
@@ -88,10 +84,10 @@ class CausalSelfAttention(nn.Module):
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
             v = v + gate.unsqueeze(-1) * ve
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
+        # Fused QK-norm + rotary: RMSNorm + rotation in a single Triton kernel per tensor
         cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        q, k = norm(q), norm(k) # QK norm
+        q = fused_norm_rotary(q, cos, sin)
+        k = fused_norm_rotary(k, cos, sin)
 
         # Flash Attention (FA3 on Hopper+, PyTorch SDPA fallback elsewhere)
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
