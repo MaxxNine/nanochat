@@ -125,7 +125,15 @@ if _HAS_TRITON:
         seq_len, n_heads,
         D: tl.constexpr, HALF_D: tl.constexpr, BLOCK_HD: tl.constexpr,
     ):
-        """Fused RMSNorm + rotary backward. One program per (batch, seq, head)."""
+        """Fused RMSNorm + rotary backward. One program per (batch, seq, head).
+
+        Recovers x_norm and grad_x_norm from their rotated versions via R^T
+        (the transpose of the rotation matrix). This is exact because cos/sin
+        are from real rotary embeddings where cos²+sin²=1, making R orthogonal.
+
+        Memory benefit: we save `out` (already kept alive by downstream flash
+        attention) instead of `x`, avoiding ~576 MiB of extra activation memory.
+        """
         pid = tl.program_id(0)
         head = pid % n_heads
         tmp = pid // n_heads
@@ -141,7 +149,7 @@ if _HAS_TRITON:
         cols = tl.arange(0, BLOCK_HD)
         hmask = cols < HALF_D
 
-        # Load grad_output, saved output, cos, sin — all in float32
+        # Load grad_output, saved output, cos, sin, rms — all in float32
         g1 = tl.load(GRAD_OUT_ptr + g_base + cols * stride_gd, mask=hmask, other=0.0).to(tl.float32)
         g2 = tl.load(GRAD_OUT_ptr + g_base + (cols + HALF_D) * stride_gd, mask=hmask, other=0.0).to(tl.float32)
         y1 = tl.load(OUT_ptr + o_base + cols * stride_od, mask=hmask, other=0.0).to(tl.float32)
@@ -150,10 +158,12 @@ if _HAS_TRITON:
         sin_v = tl.load(SIN_ptr + cs_base + cols * stride_cd, mask=hmask, other=0.0).to(tl.float32)
         rms = tl.load(RMS_ptr + r_off)
 
-        # Inverse rotary: recover grad_x_norm and x_norm from their rotated versions
-        gxn1 = g1 * cos_v - g2 * sin_v
+        # Inverse rotary via R^T: recover x_norm and grad_x_norm
+        # R = [[cos, sin], [-sin, cos]], R^T = [[cos, -sin], [sin, cos]]
+        # Valid because cos²+sin²=1 for real rotary embeddings.
+        gxn1 = g1 * cos_v + g2 * (-sin_v)
         gxn2 = g1 * sin_v + g2 * cos_v
-        xn1 = y1 * cos_v - y2 * sin_v
+        xn1 = y1 * cos_v + y2 * (-sin_v)
         xn2 = y1 * sin_v + y2 * cos_v
 
         # RMSNorm backward: grad_x = (1/rms) * (grad_x_norm - x_norm * mean(grad_x_norm · x_norm))
@@ -285,18 +295,18 @@ class _FusedNormRotary(torch.autograd.Function):
         if _is_real_tensor(grad_output) and grad_output.is_cuda and _HAS_TRITON:
             _launch_fused_bwd(grad_output, out, rms, cos, sin, grad_x)
         else:
-            # PyTorch fallback backward
+            # PyTorch fallback backward — recover x_norm via R^T (inverse rotation)
             D = grad_output.shape[-1]
             d = D // 2
             g = grad_output.float()
             y = out.float()
             cos_f, sin_f = cos.float(), sin.float()
-            # Inverse rotary
+            # Inverse rotary via R^T to recover grad_x_norm and x_norm
             g1, g2 = g[..., :d], g[..., d:]
             y1, y2 = y[..., :d], y[..., d:]
-            gxn1 = g1 * cos_f - g2 * sin_f
+            gxn1 = g1 * cos_f + g2 * (-sin_f)
             gxn2 = g1 * sin_f + g2 * cos_f
-            xn1 = y1 * cos_f - y2 * sin_f
+            xn1 = y1 * cos_f + y2 * (-sin_f)
             xn2 = y1 * sin_f + y2 * cos_f
             # RMSNorm backward
             gxn = torch.cat([gxn1, gxn2], dim=-1)
