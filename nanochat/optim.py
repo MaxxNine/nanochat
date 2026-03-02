@@ -307,9 +307,9 @@ class MuonAdamW(torch.optim.Optimizer):
             return
         all_active = len(active_indices) == num_params
 
-        # Sparse-only optimization mode: when everything is active, use legacy one-shot
-        # stack/update to preserve the full-update memory/speed characteristics.
-        if active_only_stack and all_active:
+        # Sparse-only optimization mode: when everything is active AND chunking is off,
+        # use legacy one-shot stack/update to preserve the full-update speed characteristics.
+        if active_only_stack and all_active and stack_chunk_size <= 0:
             stacked_grads = torch.stack([pp.grad for pp in params])  # type: ignore[arg-type]
             stacked_params = torch.stack(params)
             muon_step_fused(
@@ -675,7 +675,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
             all_active = bool(active_mask[:len(params)].all().item())
 
             # Sparse-only optimization mode: use legacy one-shot update on full-active steps.
-            if active_only_stack and all_active:
+            # Only when chunking is off — otherwise respect stack_chunk_size to cap peak memory.
+            if active_only_stack and all_active and stack_chunk_size <= 0:
                 stacked_params = torch.stack(params)
                 stacked_grads = torch.stack([pp.grad for pp in params])  # type: ignore[arg-type]
                 muon_step_fused(

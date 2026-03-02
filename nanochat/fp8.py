@@ -90,15 +90,17 @@ def _to_fp8(x, fp8_dtype):
     Returns (fp8_data, inverse_scale) for use with torch._scaled_mm.
     """
     fp8_max = torch.finfo(fp8_dtype).max
-    # Compute the max absolute value across the entire tensor
-    amax = x.float().abs().max()
+    # Compute amax in native dtype (bf16 abs/max is exact — no precision loss
+    # for finding the maximum). Avoids a full float32 copy just for one scalar.
+    amax = x.abs().max()
     # Scale maps [0, amax] -> [0, fp8_max]. Use float64 for the division to
     # ensure consistent numerics between torch.compile and eager mode.
     # (torchao does the same upcast — without it, compile/eager can diverge)
     scale = fp8_max / amax.double().clamp(min=EPS)
     scale = scale.float()
     # Quantize: scale into FP8 range, saturate (clamp prevents overflow when
-    # casting — PyTorch's default is to wrap, not saturate), then cast to FP8
+    # casting — PyTorch's default is to wrap, not saturate), then cast to FP8.
+    # Single float32 materialization for the scale+clamp+cast pipeline.
     x_scaled = x.float() * scale
     x_clamped = x_scaled.clamp(-fp8_max, fp8_max)
     x_fp8 = x_clamped.to(fp8_dtype)
