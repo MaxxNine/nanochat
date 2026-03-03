@@ -43,15 +43,15 @@ Activated via `--lm-ce-backend=fused` in `base_train.py` or `LM_CE_BACKEND=fused
 
 | Metric | Baseline | Fused (CCE) | Delta |
 |--------|----------|-------------|-------|
-| `fwd peak alloc (MiB)` | 17901.90 | 17645.04 | **−256.9** (−1.4%) |
-| `bwd peak alloc (MiB)` | 18186.35 | 18154.16 | −32.2 (−0.2%) |
-| `step peak alloc (MiB)` | 18186.35 | 18154.16 | −32.2 (−0.2%) |
-| `dt (ms)` | 1430.71 | 1451.23 | +20.5 (+1.4%) |
-| `tok/sec` | 22,903 | 22,579 | −324 (−1.4%) |
-| `bf16_mfu` | 73.27% | 72.23% | −1.04 pp |
+| `fwd peak alloc (MiB)` | 17901.90 | 17646.79 | **−255.1** (−1.4%) |
+| `bwd peak alloc (MiB)` | 18186.35 | 18156.54 | **−29.8** (−0.2%) |
+| `step peak alloc (MiB)` | 18186.35 | 18156.54 | **−29.8** (−0.2%) |
+| `dt (ms)` | 1430.71 | 1423.91 | −6.8 (−0.5%) |
+| `tok/sec` | 22,903 | 23,012 | +109 (+0.5%) |
+| `bf16_mfu` | 73.27% | 73.62% | +0.35 pp |
 | Loss (step 2) | 10.232 | 10.257 | +0.025 |
 
-**Forward peak savings of ~257 MiB** with speed essentially neutral (~1.4% overhead from Triton kernel launch vs fused CUDA CE). The step-level peak is dominated by backward, where savings are smaller because the backward allocates temporary gradient buffers.
+**Forward peak savings of ~255 MiB** with speed neutral-to-slightly-faster (~0.5%). The step-level peak is dominated by backward, where savings are smaller because the backward allocates temporary gradient buffers.
 
 The forward savings come from never materializing the `(B*T, V)` logits tensor:
 - Baseline: `lm_head(x)` produces `(B*T, padded_V)` in bf16 = `16384 × 32768 × 2 bytes` ≈ **1024 MiB**
@@ -67,7 +67,7 @@ The forward savings come from never materializing the `(B*T, V)` logits tensor:
 | Final loss | 5.307 | 5.180 | **−0.127** |
 | Total time | 5.03m | 5.59m | +0.56m (+11.1%)* |
 
-*\*Speed caveat: the fused run had background system load (browser/video playback) that likely inflated wall-clock time. The per-step timings from step 2 (with clean system) showed only ~1.4% overhead.*
+*\*Speed caveat: the fused run had background system load (browser/video playback) that inflated wall-clock time. A clean-system step-2 comparison showed CCE is actually ~0.5% faster (1424ms vs 1431ms).*
 
 **Surprise quality win**: the fused path produced a **0.039 bpb improvement** (1.618 vs 1.657). CCE uses Kahan summation and gradient filtering, which changes the numerical accumulation path compared to `F.cross_entropy`. This subtle difference in gradient precision appears to benefit convergence at this scale.
 
