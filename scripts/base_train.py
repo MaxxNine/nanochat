@@ -59,7 +59,7 @@ parser.add_argument("--fp8-skip-lm-head", action="store_true", help="skip FP8 co
 parser.add_argument("--fp8-fast-accum", action="store_true", help="(custom backend) use lower-precision forward FP8 accumulation for speed; may reduce stability")
 parser.add_argument("--fp8-weight-grad-bf16", action="store_true", help="(custom backend) compute FP8 dWeight in BF16 for speed (default is FP32 for stability)")
 parser.add_argument("--fp8-no-allow-in-graph", action="store_true", help="(custom backend) do not mark FP8 autograd op as allow_in_graph; can avoid torch.compile NaNs")
-parser.add_argument("--fp8-skip-attn-qk", action="store_true", help="skip FP8 conversion for attention c_q/c_k linears (stability guard on some GPUs)")
+parser.add_argument("--fp8-skip-attn-qk", action="store_true", help="skip FP8 conversion for attention q/k projection linears (c_q/c_k or c_qkv)")
 parser.add_argument("--fp8-include-regex", type=str, default="", help="optional regex: only convert Linear layers whose FQN matches")
 parser.add_argument("--fp8-exclude-regex", type=str, default="", help="optional regex: do not convert Linear layers whose FQN matches")
 parser.add_argument("--fp8-log-modules", action="store_true", help="print converted/skipped Linear module names for FP8")
@@ -93,6 +93,7 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--fused-qkv", action="store_true", help="use a single fused c_qkv projection instead of separate c_q/c_k/c_v")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -144,6 +145,13 @@ if device_type == "cuda":
 else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 
+# Normalize interacting feature flags before logging/config snapshot.
+if args.fused_qkv and args.fp8 and args.fp8_skip_attn_qk:
+    print0("INFO: disabling --fp8-skip-attn-qk because --fused-qkv uses a single c_qkv projection.")
+    print0("INFO: keeping FP8 enabled on c_qkv for the intended fused_qkv fast path.")
+    args.fp8_skip_attn_qk = False
+# Refresh user config after potential auto-adjustments.
+user_config = vars(args).copy()
 # wandb logging init
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
@@ -183,6 +191,7 @@ def build_model_meta(depth):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        fused_qkv=args.fused_qkv,
         window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
@@ -199,6 +208,8 @@ model.init_weights() # 3) All tensors get initialized
 model.configure_lm_ce(args.lm_ce_backend, args.lm_ce_chunk_size)
 if args.lm_ce_backend != "baseline":
     print0(f"✓ LM CE backend enabled: {args.lm_ce_backend} (chunk_size={args.lm_ce_chunk_size})")
+if args.fused_qkv:
+    print0("✓ Attention fused projection enabled: c_qkv")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -249,7 +260,7 @@ if args.fp8:
                     return False
                 if args.fp8_skip_lm_head and fqn == "lm_head":
                     return False
-                if args.fp8_skip_attn_qk and re.search(r"\.attn\.(c_q|c_k)$", fqn) is not None:
+                if args.fp8_skip_attn_qk and re.search(r"\.attn\.(c_q|c_k|c_qkv)$", fqn) is not None:
                     return False
                 if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
                     return False

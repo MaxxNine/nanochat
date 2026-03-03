@@ -90,7 +90,7 @@ MODEL_TAG="${MODEL_TAG:-small_baseline}"
 DEPTH="${DEPTH:-24}"
 WINDOW_PATTERN="${WINDOW_PATTERN:-L}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
-DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-1}"
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-2}"
 TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-32768}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-300}"
 TARGET_PARAM_DATA_RATIO="${TARGET_PARAM_DATA_RATIO:--1}"
@@ -113,6 +113,7 @@ LM_CE_CHUNK_SIZE="${LM_CE_CHUNK_SIZE:-4096}"
 MUON_ACTIVE_ONLY_STACK="${MUON_ACTIVE_ONLY_STACK:-1}"   # 0|1
 MUON_STACK_CHUNK_SIZE="${MUON_STACK_CHUNK_SIZE:-4}"     # 0 disables chunking
 POST_ACCUM_HOOKS="${POST_ACCUM_HOOKS:-1}"               # 0|1
+FUSED_QKV="${FUSED_QKV:-0}"                             # 0|1
 
 # Dynamic suffix feature flags
 BLOCK_UPDATE_SCHEDULE="${BLOCK_UPDATE_SCHEDULE:-dynamic_suffix}"  # full_update|dynamic_suffix
@@ -186,6 +187,10 @@ if [ "$POST_ACCUM_HOOKS" = "1" ]; then
     BASE_TRAIN_ARGS+=("--post-accum-hooks")
 fi
 
+if [ "$FUSED_QKV" = "1" ]; then
+    BASE_TRAIN_ARGS+=("--fused-qkv")
+fi
+
 if [ "$DEBUG_MEM_EVERY" -gt 0 ]; then
     BASE_TRAIN_ARGS+=("--debug-mem-every=$DEBUG_MEM_EVERY")
 fi
@@ -196,6 +201,13 @@ fi
 
 # Stability-first fallback for the hardest combo (dynamic suffix + custom FP8).
 FP8_DYNAMIC_SAFE_ARGS="${FP8_DYNAMIC_SAFE_ARGS:---fp8-skip-lm-head --fp8-skip-attn-qk --fp8-min-dim=256 --fp8-no-allow-in-graph}"
+if [ "$FUSED_QKV" = "1" ] && [ "$USE_FP8" = "1" ] && [ "$FP8_BACKEND" = "custom" ] && [ "$BLOCK_UPDATE_SCHEDULE" = "dynamic_suffix" ] && [ "${FP8_DYNAMIC_AUTO_SAFE:-1}" = "1" ]; then
+    if [[ " $FP8_DYNAMIC_SAFE_ARGS " == *" --fp8-skip-attn-qk "* ]]; then
+        echo "INFO: fused_qkv is enabled; removing --fp8-skip-attn-qk from FP8 dynamic safe args."
+        echo "INFO: this keeps FP8 active on c_qkv (intended fused_qkv path)."
+        FP8_DYNAMIC_SAFE_ARGS="${FP8_DYNAMIC_SAFE_ARGS//--fp8-skip-attn-qk/}"
+    fi
+fi
 if [ "$USE_FP8" = "1" ] && [ "$FP8_BACKEND" = "custom" ] && [ "$BLOCK_UPDATE_SCHEDULE" = "dynamic_suffix" ] && [ "${FP8_DYNAMIC_AUTO_SAFE:-1}" = "1" ]; then
     # shellcheck disable=SC2206
     SAFE_ARGS_ARRAY=($FP8_DYNAMIC_SAFE_ARGS)
@@ -214,6 +226,7 @@ echo "run=$RUN_NAME model_tag=$MODEL_TAG nproc=$NPROC_PER_NODE max_restarts=$TOR
 echo "lm_ce: backend=$LM_CE_BACKEND chunk_size=$LM_CE_CHUNK_SIZE"
 echo "muon: active_only_stack=$MUON_ACTIVE_ONLY_STACK stack_chunk_size=$MUON_STACK_CHUNK_SIZE"
 echo "adamw: post_accum_hooks=$POST_ACCUM_HOOKS"
+echo "attention: fused_qkv=$FUSED_QKV"
 echo "dynamic: warmup=$DYN_WARMUP_STEPS probe_every=$DYN_PROBE_EVERY refresh_every=$DYN_REFRESH_EVERY min_active=$DYN_MIN_ACTIVE_LAYERS max_active=$DYN_MAX_ACTIVE_LAYERS freeze_start_step=$DYN_FREEZE_START_STEP freeze_start_frac=$DYN_FREEZE_START_FRAC threshold=$DYN_RELEVANCE_THRESHOLD"
 echo "memory-guard: empty_cache_before_probe=$EMPTY_CACHE_BEFORE_PROBE cuda_alloc_conf=${PYTORCH_ALLOC_CONF:-unset}"
 if [ "$DEBUG_MEM_EVERY" -gt 0 ]; then

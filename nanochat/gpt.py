@@ -35,6 +35,7 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    fused_qkv: bool = False
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
@@ -52,6 +53,7 @@ def has_ve(layer_idx, n_layer):
 
 # apply_rotary_emb is imported from nanochat.rotary (Triton kernel with PyTorch fallback)
 
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -60,11 +62,16 @@ class CausalSelfAttention(nn.Module):
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        self.fused_qkv = bool(getattr(config, "fused_qkv", False))
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        if self.fused_qkv:
+            out_features = (self.n_head + 2 * self.n_kv_head) * self.head_dim
+            self.c_qkv = nn.Linear(self.n_embd, out_features, bias=False)
+        else:
+            self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+            self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
@@ -72,11 +79,20 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
 
-        # Project the input to get queries, keys, and values
-        # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        # Project input to get queries, keys, and values.
+        # Shape after view: (B, T, H, D) - FA3 native layout, no transpose needed.
+        if self.fused_qkv:
+            q_dim = self.n_head * self.head_dim
+            kv_dim = self.n_kv_head * self.head_dim
+            qkv = self.c_qkv(x)
+            q, k, v = torch.split(qkv, [q_dim, kv_dim, kv_dim], dim=-1)
+            q = q.view(B, T, self.n_head, self.head_dim)
+            k = k.view(B, T, self.n_kv_head, self.head_dim)
+            v = v.view(B, T, self.n_kv_head, self.head_dim)
+        else:
+            q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
@@ -375,9 +391,8 @@ class GPT(nn.Module):
         wte (embedding):     normal, std=1.0
         lm_head:             normal, std=0.001
         for each block:
-            attn.c_q:        uniform, std=1/sqrt(n_embd)
-            attn.c_k:        uniform, std=1/sqrt(n_embd)
-            attn.c_v:        uniform, std=1/sqrt(n_embd)
+            attn.c_qkv or
+            attn.c_q/c_k/c_v: uniform, std=1/sqrt(n_embd)
             attn.c_proj:     zeros
             mlp.c_fc:        uniform, std=1/sqrt(n_embd)
             mlp.c_proj:      zeros
@@ -391,9 +406,12 @@ class GPT(nn.Module):
         n_embd = self.config.n_embd
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
-            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            if block.attn.fused_qkv:
+                torch.nn.init.uniform_(block.attn.c_qkv.weight, -s, s) # weights use Uniform to avoid outliers
+            else:
+                torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
@@ -480,6 +498,45 @@ class GPT(nn.Module):
             raise ValueError(f"lm_ce_chunk_size must be > 0, got {chunk_size}")
         self.lm_ce_backend = backend
         self.lm_ce_chunk_size = chunk_size
+
+    def _convert_attention_state_dict(self, state_dict):
+        """
+        Convert checkpoint keys between split (c_q/c_k/c_v) and fused (c_qkv).
+        This preserves strict checkpoint loading across both attention layouts.
+        """
+        sd = dict(state_dict)
+        use_fused = bool(getattr(self.config, "fused_qkv", False))
+        head_dim = self.config.n_embd // self.config.n_head
+        q_dim = self.config.n_head * head_dim
+        kv_dim = self.config.n_kv_head * head_dim
+        for i in range(self.config.n_layer):
+            prefix = f"transformer.h.{i}.attn."
+            q_key = prefix + "c_q.weight"
+            k_key = prefix + "c_k.weight"
+            v_key = prefix + "c_v.weight"
+            qkv_key = prefix + "c_qkv.weight"
+            has_split = q_key in sd and k_key in sd and v_key in sd
+            has_qkv = qkv_key in sd
+            if use_fused:
+                if (not has_qkv) and has_split:
+                    sd[qkv_key] = torch.cat((sd[q_key], sd[k_key], sd[v_key]), dim=0)
+                if has_split:
+                    sd.pop(q_key, None)
+                    sd.pop(k_key, None)
+                    sd.pop(v_key, None)
+            else:
+                if (not has_split) and has_qkv:
+                    w_q, w_k, w_v = torch.split(sd[qkv_key], [q_dim, kv_dim, kv_dim], dim=0)
+                    sd[q_key] = w_q
+                    sd[k_key] = w_k
+                    sd[v_key] = w_v
+                if has_qkv:
+                    sd.pop(qkv_key, None)
+        return sd
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        converted = self._convert_attention_state_dict(state_dict)
+        return super().load_state_dict(converted, strict=strict, assign=assign)
 
     def estimate_flops(self):
         """
