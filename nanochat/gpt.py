@@ -583,7 +583,8 @@ class GPT(nn.Module):
                 stack_chunk_size=int(muon_stack_chunk_size),
             ))
 
-        Factory = DistMuonAdamW if ddp else MuonAdamW
+        # torchrun --nproc_per_node=1 sets DDP env vars, but we still want single-rank optimizer behavior.
+        Factory = DistMuonAdamW if (ddp and world_size > 1) else MuonAdamW
         optimizer = Factory(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]

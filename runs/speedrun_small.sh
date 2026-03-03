@@ -17,7 +17,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export NANOCHAT_BASE_DIR="${NANOCHAT_BASE_DIR:-$HOME/.cache/nanochat}"
 # Prefer fragmentation-friendly allocator settings unless caller overrides.
 if [ -z "${PYTORCH_ALLOC_CONF:-}" ]; then
-    export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF_DEFAULT:-expandable_segments:True,max_split_size_mb:128}"
+    export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF_DEFAULT:-expandable_segments:True}"
 fi
 mkdir -p "$NANOCHAT_BASE_DIR"
 
@@ -87,10 +87,10 @@ NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 TORCHRUN_MAX_RESTARTS="${TORCHRUN_MAX_RESTARTS:-0}"
 RUN_NAME="${RUN_NAME:-dummy}"          # "dummy" disables wandb logging
 MODEL_TAG="${MODEL_TAG:-small_baseline}"
-DEPTH="${DEPTH:-24}"
+DEPTH="${DEPTH:-25}"
 WINDOW_PATTERN="${WINDOW_PATTERN:-L}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
-DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-2}"
+DEVICE_BATCH_SIZE="${DEVICE_BATCH_SIZE:-1}"
 TOTAL_BATCH_SIZE="${TOTAL_BATCH_SIZE:-32768}"
 NUM_ITERATIONS="${NUM_ITERATIONS:-300}"
 TARGET_PARAM_DATA_RATIO="${TARGET_PARAM_DATA_RATIO:--1}"
@@ -112,6 +112,7 @@ LM_CE_CHUNK_SIZE="${LM_CE_CHUNK_SIZE:-4096}"
 # Muon stack flags
 MUON_ACTIVE_ONLY_STACK="${MUON_ACTIVE_ONLY_STACK:-1}"   # 0|1
 MUON_STACK_CHUNK_SIZE="${MUON_STACK_CHUNK_SIZE:-4}"     # 0 disables chunking
+POST_ACCUM_HOOKS="${POST_ACCUM_HOOKS:-1}"               # 0|1
 
 # Dynamic suffix feature flags
 BLOCK_UPDATE_SCHEDULE="${BLOCK_UPDATE_SCHEDULE:-dynamic_suffix}"  # full_update|dynamic_suffix
@@ -181,6 +182,10 @@ if [ "$MUON_ACTIVE_ONLY_STACK" = "1" ]; then
     BASE_TRAIN_ARGS+=("--muon-active-only-stack")
 fi
 
+if [ "$POST_ACCUM_HOOKS" = "1" ]; then
+    BASE_TRAIN_ARGS+=("--post-accum-hooks")
+fi
+
 if [ "$DEBUG_MEM_EVERY" -gt 0 ]; then
     BASE_TRAIN_ARGS+=("--debug-mem-every=$DEBUG_MEM_EVERY")
 fi
@@ -208,6 +213,7 @@ echo "=== speedrun_small config ==="
 echo "run=$RUN_NAME model_tag=$MODEL_TAG nproc=$NPROC_PER_NODE max_restarts=$TORCHRUN_MAX_RESTARTS depth=$DEPTH seq=$MAX_SEQ_LEN dbs=$DEVICE_BATCH_SIZE tbs=$TOTAL_BATCH_SIZE steps=$NUM_ITERATIONS fp8=$USE_FP8 backend=$FP8_BACKEND recipe=$FP8_RECIPE schedule=$BLOCK_UPDATE_SCHEDULE"
 echo "lm_ce: backend=$LM_CE_BACKEND chunk_size=$LM_CE_CHUNK_SIZE"
 echo "muon: active_only_stack=$MUON_ACTIVE_ONLY_STACK stack_chunk_size=$MUON_STACK_CHUNK_SIZE"
+echo "adamw: post_accum_hooks=$POST_ACCUM_HOOKS"
 echo "dynamic: warmup=$DYN_WARMUP_STEPS probe_every=$DYN_PROBE_EVERY refresh_every=$DYN_REFRESH_EVERY min_active=$DYN_MIN_ACTIVE_LAYERS max_active=$DYN_MAX_ACTIVE_LAYERS freeze_start_step=$DYN_FREEZE_START_STEP freeze_start_frac=$DYN_FREEZE_START_FRAC threshold=$DYN_RELEVANCE_THRESHOLD"
 echo "memory-guard: empty_cache_before_probe=$EMPTY_CACHE_BEFORE_PROBE cuda_alloc_conf=${PYTORCH_ALLOC_CONF:-unset}"
 if [ "$DEBUG_MEM_EVERY" -gt 0 ]; then

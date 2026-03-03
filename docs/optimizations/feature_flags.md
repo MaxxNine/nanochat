@@ -39,7 +39,7 @@ This file is the canonical list of optimization feature flags used for 1x4090 ex
 - `--muon-stack-chunk-size`
 
 ## LM-Head CE Flags
-- `--lm-ce-backend {baseline,chunked}`
+- `--lm-ce-backend {baseline,chunked,fused}`
 - `--lm-ce-chunk-size`
 
 Notes:

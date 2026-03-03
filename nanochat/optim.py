@@ -232,41 +232,83 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._adamw_hooked = False
+        self._adamw_post_accum_handles: list[object] = []
+
+    def _adamw_update_param(self, p: Tensor, group: dict) -> None:
+        grad = p.grad
+        if grad is None:
+            return
+        state = self.state[p]
+
+        # State init
+        if not state:
+            state['step'] = 0
+            state['exp_avg'] = torch.zeros_like(p)
+            state['exp_avg_sq'] = torch.zeros_like(p)
+        exp_avg = state['exp_avg']
+        exp_avg_sq = state['exp_avg_sq']
+        state['step'] += 1
+
+        # Fill 0-D tensors with current values
+        self._adamw_step_t.fill_(state['step'])
+        self._adamw_lr_t.fill_(group['lr'])
+        self._adamw_beta1_t.fill_(group['betas'][0])
+        self._adamw_beta2_t.fill_(group['betas'][1])
+        self._adamw_eps_t.fill_(group['eps'])
+        self._adamw_wd_t.fill_(group['weight_decay'])
+
+        # Fused update: weight_decay -> momentum -> bias_correction -> param_update
+        adamw_step_fused(
+            p, grad, exp_avg, exp_avg_sq,
+            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
+        )
+
+    def install_post_accum_hooks(self) -> None:
+        if self._adamw_hooked:
+            return
+        if not hasattr(torch.Tensor, "register_post_accumulate_grad_hook"):
+            raise RuntimeError("register_post_accumulate_grad_hook is not available in this PyTorch build.")
+        self._adamw_post_accum_handles = []
+
+        for group in self.param_groups:
+            if group['kind'] != 'adamw':
+                continue
+            for p in group['params']:
+                if not p.requires_grad:
+                    continue
+
+                def _hook(param: Tensor, group=group):
+                    if param.grad is None:
+                        return
+                    with torch.no_grad():
+                        self._adamw_update_param(param, group)
+                        # Free AdamW gradients immediately after this parameter has been stepped.
+                        param.grad = None
+
+                handle = p.register_post_accumulate_grad_hook(_hook)
+                self._adamw_post_accum_handles.append(handle)
+
+        self._adamw_hooked = True
+
+    def remove_post_accum_hooks(self) -> None:
+        for handle in self._adamw_post_accum_handles:
+            handle.remove()
+        self._adamw_post_accum_handles = []
+        self._adamw_hooked = False
 
     def _step_adamw(self, group: dict) -> None:
         """
         AdamW update for each param in the group individually.
         Lazy init the state, fill in all 0-D tensors, call the fused kernel.
         """
+        if self._adamw_hooked:
+            return
         for p in group['params']:
             if p.grad is None:
                 continue
-            grad = p.grad
-            state = self.state[p]
-
-            # State init
-            if not state:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
-            exp_avg = state['exp_avg']
-            exp_avg_sq = state['exp_avg_sq']
-            state['step'] += 1
-
-            # Fill 0-D tensors with current values
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
-
-            # Fused update: weight_decay -> momentum -> bias_correction -> param_update
-            adamw_step_fused(
-                p, grad, exp_avg, exp_avg_sq,
-                self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
-            )
+            self._adamw_update_param(p, group)
 
     def _step_muon(self, group: dict) -> None:
         """

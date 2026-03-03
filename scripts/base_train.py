@@ -109,6 +109,7 @@ parser.add_argument("--adam-beta1", type=float, default=0.8, help="Adam beta1 fo
 parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 for embedding/unembedding")
 parser.add_argument("--muon-active-only-stack", action="store_true", help="Muon: stack only active parameters (grad != None) on each step")
 parser.add_argument("--muon-stack-chunk-size", type=int, default=0, help="Muon: max number of params per stacked update chunk (0 = no chunking)")
+parser.add_argument("--post-accum-hooks", action="store_true", help="AdamW: step and free grads inside backward via register_post_accumulate_grad_hook")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
@@ -641,6 +642,18 @@ grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
+if args.post_accum_hooks:
+    if ddp_world_size != 1:
+        raise ValueError("--post-accum-hooks currently supports single-rank runs only.")
+    if not hasattr(optimizer, "install_post_accum_hooks"):
+        raise ValueError("Optimizer does not support --post-accum-hooks.")
+    if grad_accum_steps > 1:
+        print0(
+            f"WARNING: --post-accum-hooks is active with grad_accum_steps={grad_accum_steps}; "
+            "AdamW will update once per micro-step."
+        )
+    optimizer.install_post_accum_hooks()
+    print0("✓ AdamW post-accum hooks enabled")
 
 # -----------------------------------------------------------------------------
 # Optional dynamic suffix block-update schedule (feature-flagged)
@@ -824,6 +837,16 @@ while True:
         torch.cuda.reset_peak_memory_stats()
     synchronize()
     t0 = time.time()
+    # Set step-level optimizer hyperparameters before backward.
+    # This is required for --post-accum-hooks because AdamW updates run inside backward hooks.
+    lrm = get_lr_multiplier(step)
+    muon_momentum = get_muon_momentum(step)
+    muon_weight_decay = get_weight_decay(step)
+    for group in optimizer.param_groups:
+        group["lr"] = group["initial_lr"] * lrm
+        if group['kind'] == 'muon':
+            group["momentum"] = muon_momentum
+            group["weight_decay"] = muon_weight_decay
 
     for micro_step in range(grad_accum_steps):
         if mem_debug_step:
@@ -909,14 +932,6 @@ while True:
     mem_after_bwd_reserved = get_reserved_memory()
 
     # step the optimizer
-    lrm = get_lr_multiplier(step)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(step)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
     if mem_debug_step:
         torch.cuda.reset_peak_memory_stats()
     optimizer.step()
