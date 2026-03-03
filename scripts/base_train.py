@@ -27,6 +27,11 @@ from contextlib import nullcontext, contextmanager
 import wandb
 import torch
 
+# Early parse for torch.compile decorators before nanochat is imported
+import sys
+if "--fp8-no-allow-in-graph" in sys.argv:
+    os.environ["NANOCHAT_FP8_ALLOW_IN_GRAPH"] = "0"
+
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops
@@ -65,7 +70,7 @@ parser.add_argument("--debug-max-nonfinite", type=int, default=8, help="max numb
 parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for debugging)")
 parser.add_argument("--debug-mem-every", type=int, default=0, help="if >0 and CUDA, print memory breakdown every N steps (for peak diagnosis)")
 # LM-head CE backend (feature-flagged memory optimization)
-parser.add_argument("--lm-ce-backend", type=str, default="baseline", choices=["baseline", "chunked"], help="lm_head CE implementation: baseline full-logits or chunked exact CE")
+parser.add_argument("--lm-ce-backend", type=str, default="baseline", choices=["baseline", "chunked", "fused"], help="lm_head CE implementation: baseline full-logits, chunked exact CE, or fused Triton CE")
 parser.add_argument("--lm-ce-chunk-size", type=int, default=4096, help="chunk size over vocab for --lm-ce-backend=chunked")
 # Block update schedule (feature-flagged optimization for 1x4090 experiments)
 parser.add_argument("--block-update-schedule", type=str, default="full_update", choices=["full_update", "dynamic_suffix"], help="block training schedule: full_update (default) or dynamic_suffix")
@@ -191,8 +196,8 @@ print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
 model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
 model.init_weights() # 3) All tensors get initialized
 model.configure_lm_ce(args.lm_ce_backend, args.lm_ce_chunk_size)
-if args.lm_ce_backend == "chunked":
-    print0(f"✓ LM CE backend enabled: chunked (chunk_size={args.lm_ce_chunk_size})")
+if args.lm_ce_backend != "baseline":
+    print0(f"✓ LM CE backend enabled: {args.lm_ce_backend} (chunk_size={args.lm_ce_chunk_size})")
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
@@ -224,7 +229,6 @@ if args.fp8:
             print0(f"Warning: FP8 matmul is not supported on compute capability {major}.{minor}, ignoring --fp8 flag")
         else:
             if args.fp8_backend == "custom":
-                os.environ["NANOCHAT_FP8_ALLOW_IN_GRAPH"] = "0" if args.fp8_no_allow_in_graph else "1"
                 from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
                 if args.fp8_recipe != "tensorwise":
                     raise ValueError(

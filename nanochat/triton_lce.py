@@ -42,8 +42,8 @@ def triton_lce_use_forward() -> bool:
 
 
 def triton_lce_use_backward() -> bool:
-    # Current backward kernel uses atomics heavily and may be slower on some setups.
-    return os.environ.get("NANOCHAT_TLCE_USE_BWD", "0") == "1"
+    # Backward kernel uses atomics for grad accumulation; disable via NANOCHAT_TLCE_USE_BWD=0 if needed.
+    return os.environ.get("NANOCHAT_TLCE_USE_BWD", "1") == "1"
 
 
 def _can_use_tlce_tensors(h: torch.Tensor, w: torch.Tensor) -> bool:

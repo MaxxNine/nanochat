@@ -306,6 +306,22 @@ def chunked_linear_cross_entropy(h, weight, targets, softcap=15.0, chunk_size=40
     return out
 
 
+def fused_linear_cross_entropy(h, weight, targets, softcap=15.0, chunk_size=4096, reduction='mean'):
+    """Memory-efficient fused linear+CE via cut-cross-entropy (Apple).
+
+    Never materializes full (N, V) logits. Uses production-quality Triton
+    kernels with no atomics in backward and no torch.compile graph breaks.
+    The chunk_size arg is accepted for API compatibility but unused.
+    """
+    from cut_cross_entropy import linear_cross_entropy
+    return linear_cross_entropy(
+        h, weight, targets,
+        ignore_index=-1,
+        softcap=softcap,
+        reduction=reduction,
+    )
+
+
 class GPT(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -457,8 +473,8 @@ class GPT(nn.Module):
 
     def configure_lm_ce(self, backend="baseline", chunk_size=4096):
         backend = str(backend).lower()
-        if backend not in {"baseline", "chunked"}:
-            raise ValueError(f"Unknown lm_ce backend '{backend}'. Use baseline|chunked.")
+        if backend not in {"baseline", "chunked", "fused"}:
+            raise ValueError(f"Unknown lm_ce backend '{backend}'. Use baseline|chunked|fused.")
         chunk_size = int(chunk_size)
         if chunk_size <= 0:
             raise ValueError(f"lm_ce_chunk_size must be > 0, got {chunk_size}")
@@ -616,12 +632,13 @@ class GPT(nn.Module):
 
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         if targets is not None:
-            # Training: optionally use exact chunked CE to avoid full (B,T,V) logits materialization.
-            if self.lm_ce_backend == "chunked":
+            # Training: optionally use memory-efficient CE to avoid full (B,T,V) logits materialization.
+            if self.lm_ce_backend in ("chunked", "fused"):
                 h = x.view(-1, x.size(-1))
                 y = targets.view(-1)
                 w = self.lm_head.weight[:self.config.vocab_size]
-                loss = chunked_linear_cross_entropy(
+                ce_fn = fused_linear_cross_entropy if self.lm_ce_backend == "fused" else chunked_linear_cross_entropy
+                loss = ce_fn(
                     h, w, y,
                     softcap=softcap,
                     chunk_size=self.lm_ce_chunk_size,
