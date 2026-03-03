@@ -111,6 +111,8 @@ parser.add_argument("--adam-beta2", type=float, default=0.95, help="Adam beta2 f
 parser.add_argument("--muon-active-only-stack", action="store_true", help="Muon: stack only active parameters (grad != None) on each step")
 parser.add_argument("--muon-stack-chunk-size", type=int, default=0, help="Muon: max number of params per stacked update chunk (0 = no chunking)")
 parser.add_argument("--post-accum-hooks", action="store_true", help="AdamW: step and free grads inside backward via register_post_accumulate_grad_hook")
+parser.add_argument("--adamw-8bit", action="store_true", help="use bitsandbytes AdamW8bit for AdamW parameter groups (experimental, single-rank only)")
+parser.add_argument("--adamw-8bit-min-size", type=int, default=4096, help="bitsandbytes AdamW8bit min_8bit_size threshold")
 parser.add_argument("--warmup-ratio", type=float, default=0.0, help="ratio of iterations for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR as fraction of initial LR")
@@ -551,12 +553,16 @@ optimizer = model.setup_optimizer(
     weight_decay=weight_decay_scaled,
     muon_active_only_stack=args.muon_active_only_stack,
     muon_stack_chunk_size=args.muon_stack_chunk_size,
+    adamw_8bit=args.adamw_8bit,
+    adamw_8bit_min_size=args.adamw_8bit_min_size,
 )
 if args.muon_active_only_stack or args.muon_stack_chunk_size > 0:
     print0(
         f"✓ Muon stack flags: active_only_stack={args.muon_active_only_stack}, "
         f"stack_chunk_size={args.muon_stack_chunk_size}"
     )
+if args.adamw_8bit:
+    print0(f"✓ AdamW 8-bit mode enabled (min_8bit_size={args.adamw_8bit_min_size})")
 
 if resuming:
     optimizer.load_state_dict(optimizer_data)

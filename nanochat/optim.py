@@ -486,6 +486,122 @@ class MuonAdamW(torch.optim.Optimizer):
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
+
+class MuonAdamW8bit(MuonAdamW):
+    """
+    Experimental hybrid optimizer:
+    - Muon path is unchanged (same as MuonAdamW)
+    - AdamW path uses bitsandbytes AdamW8bit for optimizer-state memory savings
+
+    Notes:
+    - Single-rank only (no distributed ZeRO-style path here)
+    - Supports post-accumulate grad hooks (experimental)
+    """
+
+    def __init__(self, param_groups: list[dict], min_8bit_size: int = 4096):
+        super().__init__(param_groups)
+        try:
+            import bitsandbytes as bnb
+        except Exception as e:
+            raise RuntimeError(
+                "MuonAdamW8bit requires bitsandbytes. Install it first (e.g. `uv pip install bitsandbytes`)."
+            ) from e
+
+        self._adamw8_group_indices: list[int] = []
+        adamw_groups: list[dict] = []
+        for idx, group in enumerate(self.param_groups):
+            if group["kind"] != "adamw":
+                continue
+            if not group["params"]:
+                continue
+            self._adamw8_group_indices.append(idx)
+            adamw_groups.append(
+                dict(
+                    params=group["params"],
+                    lr=group["lr"],
+                    betas=group["betas"],
+                    eps=group["eps"],
+                    weight_decay=group["weight_decay"],
+                )
+            )
+
+        self._adamw8 = bnb.optim.AdamW8bit(
+            adamw_groups,
+            min_8bit_size=int(min_8bit_size),
+        )
+
+    def install_post_accum_hooks(self) -> None:
+        if self._adamw_hooked:
+            return
+        if not hasattr(torch.Tensor, "register_post_accumulate_grad_hook"):
+            raise RuntimeError("register_post_accumulate_grad_hook is not available in this PyTorch build.")
+        self._adamw_post_accum_handles = []
+
+        for group in self.param_groups:
+            if group["kind"] != "adamw":
+                continue
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+
+                def _hook(param: Tensor):
+                    if param.grad is None:
+                        return
+                    with torch.no_grad():
+                        # Update AdamW8bit as soon as this grad is accumulated.
+                        # In hook mode we rely on grads being cleared immediately to
+                        # avoid duplicate updates across repeated .step() calls.
+                        self._sync_adamw8_hparams()
+                        self._adamw8.step()
+                        param.grad = None
+
+                handle = p.register_post_accumulate_grad_hook(_hook)
+                self._adamw_post_accum_handles.append(handle)
+
+        self._adamw_hooked = True
+
+    def remove_post_accum_hooks(self) -> None:
+        for handle in self._adamw_post_accum_handles:
+            handle.remove()
+        self._adamw_post_accum_handles = []
+        self._adamw_hooked = False
+
+    def _sync_adamw8_hparams(self) -> None:
+        for bnb_group, idx in zip(self._adamw8.param_groups, self._adamw8_group_indices):
+            group = self.param_groups[idx]
+            bnb_group["lr"] = group["lr"]
+            bnb_group["betas"] = group["betas"]
+            bnb_group["eps"] = group["eps"]
+            bnb_group["weight_decay"] = group["weight_decay"]
+
+    @torch.no_grad()
+    def step(self):
+        if not self._adamw_hooked:
+            self._sync_adamw8_hparams()
+            self._adamw8.step()
+        for group in self.param_groups:
+            if group["kind"] == "muon":
+                self._step_muon(group)
+            elif group["kind"] != "adamw":
+                raise ValueError(f"Unknown optimizer kind: {group['kind']}")
+
+    def state_dict(self):
+        out = super().state_dict()
+        out["_adamw8_state_dict"] = self._adamw8.state_dict()
+        out["_adamw8_group_indices"] = list(self._adamw8_group_indices)
+        return out
+
+    def load_state_dict(self, state_dict):
+        adamw8_state = state_dict.pop("_adamw8_state_dict", None)
+        state_dict.pop("_adamw8_group_indices", None)
+        super().load_state_dict(state_dict)
+        # Drop any legacy AdamW fp32 states; 8-bit path keeps its own states.
+        for idx in self._adamw8_group_indices:
+            for p in self.param_groups[idx]["params"]:
+                self.state[p] = {}
+        if adamw8_state is not None:
+            self._adamw8.load_state_dict(adamw8_state)
+
 # -----------------------------------------------------------------------------
 # Distributed version of the MuonAdamW optimizer.
 # Used for training on multiple GPUs.

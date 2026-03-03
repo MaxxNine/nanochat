@@ -20,7 +20,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from nanochat.common import get_dist_info, print0
-from nanochat.optim import MuonAdamW, DistMuonAdamW
+from nanochat.optim import MuonAdamW, MuonAdamW8bit, DistMuonAdamW
 
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
@@ -604,6 +604,8 @@ class GPT(nn.Module):
         scalar_lr=0.5,
         muon_active_only_stack=False,
         muon_stack_chunk_size=0,
+        adamw_8bit=False,
+        adamw_8bit_min_size=4096,
     ):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
@@ -641,8 +643,15 @@ class GPT(nn.Module):
             ))
 
         # torchrun --nproc_per_node=1 sets DDP env vars, but we still want single-rank optimizer behavior.
-        Factory = DistMuonAdamW if (ddp and world_size > 1) else MuonAdamW
-        optimizer = Factory(param_groups)
+        if ddp and world_size > 1:
+            if adamw_8bit:
+                raise ValueError("--adamw-8bit currently supports single-rank runs only.")
+            optimizer = DistMuonAdamW(param_groups)
+        else:
+            if adamw_8bit:
+                optimizer = MuonAdamW8bit(param_groups, min_8bit_size=adamw_8bit_min_size)
+            else:
+                optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
