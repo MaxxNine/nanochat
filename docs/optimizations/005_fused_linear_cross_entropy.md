@@ -63,11 +63,9 @@ The forward savings come from never materializing the `(B*T, V)` logits tensor:
 |--------|----------|-------------|-------|
 | Peak memory (MiB) | 18186.37 | 18156.56 | **−29.8** |
 | Avg step peak memory (MiB) | 15065.62 | 14896.80 | **−168.8** (−1.1%) |
-| Min validation bpb | 1.657326 | 1.618329 | **−0.039** (−2.4%) |
+| Min validation bpb | 1.657326 | 1.618183 | **−0.039** (−2.4%) |
 | Final loss | 5.307 | 5.180 | **−0.127** |
-| Total time | 5.03m | 5.59m | +0.56m (+11.1%)* |
-
-*\*Speed caveat: the fused run had background system load (browser/video playback) that inflated wall-clock time. A clean-system step-2 comparison showed CCE is actually ~0.5% faster (1424ms vs 1431ms).*
+| Total time | 5.03m | 5.16m | +0.13m (+2.6%) |
 
 **Surprise quality win**: the fused path produced a **0.039 bpb improvement** (1.618 vs 1.657). CCE uses Kahan summation and gradient filtering, which changes the numerical accumulation path compared to `F.cross_entropy`. This subtle difference in gradient precision appears to benefit convergence at this scale.
 
