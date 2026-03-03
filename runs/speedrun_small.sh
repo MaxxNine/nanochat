@@ -107,7 +107,7 @@ USE_FP8="${USE_FP8:-1}"
 FP8_BACKEND="${FP8_BACKEND:-custom}"      # custom|torchao
 FP8_RECIPE="${FP8_RECIPE:-tensorwise}"    # tensorwise|rowwise (rowwise requires torchao)
 # LM-head CE backend flags
-LM_CE_BACKEND="${LM_CE_BACKEND:-baseline}"   # baseline|chunked|fused
+LM_CE_BACKEND="${LM_CE_BACKEND:-fused}"   # baseline|chunked|fused
 LM_CE_CHUNK_SIZE="${LM_CE_CHUNK_SIZE:-4096}"
 # Muon stack flags
 MUON_ACTIVE_ONLY_STACK="${MUON_ACTIVE_ONLY_STACK:-1}"   # 0|1

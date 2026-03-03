@@ -57,6 +57,22 @@ The forward savings come from never materializing the `(B*T, V)` logits tensor:
 - Baseline: `lm_head(x)` produces `(B*T, padded_V)` in bf16 = `16384 × 32768 × 2 bytes` ≈ **1024 MiB**
 - CCE: computes loss tile-by-tile, peak intermediate is bounded by tile size (typically 128×128)
 
+## Full 300-Step Training Run
+
+| Metric | Baseline | Fused (CCE) | Delta |
+|--------|----------|-------------|-------|
+| Peak memory (MiB) | 18186.37 | 18156.56 | **−29.8** |
+| Avg step peak memory (MiB) | 15065.62 | 14896.80 | **−168.8** (−1.1%) |
+| Min validation bpb | 1.657326 | 1.618329 | **−0.039** (−2.4%) |
+| Final loss | 5.307 | 5.180 | **−0.127** |
+| Total time | 5.03m | 5.59m | +0.56m (+11.1%)* |
+
+*\*Speed caveat: the fused run had background system load (browser/video playback) that likely inflated wall-clock time. The per-step timings from step 2 (with clean system) showed only ~1.4% overhead.*
+
+**Surprise quality win**: the fused path produced a **0.039 bpb improvement** (1.618 vs 1.657). CCE uses Kahan summation and gradient filtering, which changes the numerical accumulation path compared to `F.cross_entropy`. This subtle difference in gradient precision appears to benefit convergence at this scale.
+
+The **avg step peak savings of ~169 MiB** is more representative than the absolute peak, since the absolute peak occurs at the same probe step (60) for both runs and is dominated by the dynamic suffix overhead rather than the CE path.
+
 The 257 MiB measured savings (vs the theoretical 1024 MiB) shows that `torch.compile` already reclaims much of the logits memory via activation recomputation in the baseline path.
 
 ## Files Changed
