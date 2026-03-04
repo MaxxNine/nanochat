@@ -233,6 +233,7 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._adamw_hooked = False
+        self._muon_hooked = False
         self._adamw_post_accum_handles: list[object] = []
 
     def _adamw_update_param(self, p: Tensor, group: dict) -> None:
@@ -265,6 +266,52 @@ class MuonAdamW(torch.optim.Optimizer):
             self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t,
         )
 
+    def _install_muon_grad_hooks(self) -> None:
+        """
+        Hook Muon params to pre-stack gradients into a contiguous buffer during backward.
+
+        Each hook copies the freshly-computed gradient into a pre-allocated stacked buffer
+        and immediately frees the individual grad tensor. Benefits:
+        - Eliminates torch.stack() allocation in _step_muon (buffer is already stacked)
+        - Individual Muon grads are transient during backward (freed in hooks), reducing
+          backward peak memory and CUDA memory fragmentation
+        - Correctly accumulates across gradient accumulation steps (hooks add, not overwrite)
+        """
+        if self._muon_hooked:
+            return
+        for group in self.param_groups:
+            if group['kind'] != 'muon':
+                continue
+            params: list[Tensor] = group['params']
+            if not params:
+                continue
+            p0 = params[0]
+            state = self.state[p0]
+            shape, device, dtype = p0.shape, p0.device, p0.dtype
+            num_params = len(params)
+
+            # Pre-allocate contiguous grad accumulation buffer and active tracking mask.
+            grad_buffer = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+            active_mask = torch.zeros(num_params, dtype=torch.bool, device=device)
+            state['_hooked_grad_buffer'] = grad_buffer
+            state['_hooked_active_mask'] = active_mask
+
+            for i, pp in enumerate(params):
+                if not pp.requires_grad:
+                    continue
+
+                def _muon_hook(param: Tensor, idx=i, buf=grad_buffer, mask=active_mask):
+                    if param.grad is None:
+                        return
+                    buf[idx].add_(param.grad)
+                    mask[idx] = True
+                    param.grad = None
+
+                handle = pp.register_post_accumulate_grad_hook(_muon_hook)
+                self._adamw_post_accum_handles.append(handle)
+
+        self._muon_hooked = True
+
     def install_post_accum_hooks(self) -> None:
         if self._adamw_hooked:
             return
@@ -291,12 +338,25 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._adamw_post_accum_handles.append(handle)
 
         self._adamw_hooked = True
+        self._install_muon_grad_hooks()
 
     def remove_post_accum_hooks(self) -> None:
         for handle in self._adamw_post_accum_handles:
             handle.remove()
         self._adamw_post_accum_handles = []
         self._adamw_hooked = False
+        # Clean up Muon hook state
+        if self._muon_hooked:
+            for group in self.param_groups:
+                if group['kind'] != 'muon':
+                    continue
+                params = group['params']
+                if not params:
+                    continue
+                state = self.state[params[0]]
+                state.pop('_hooked_grad_buffer', None)
+                state.pop('_hooked_active_mask', None)
+            self._muon_hooked = False
 
     def _step_adamw(self, group: dict) -> None:
         """
@@ -318,8 +378,6 @@ class MuonAdamW(torch.optim.Optimizer):
         params: list[Tensor] = group['params']
         if not params:
             return
-        active_only_stack = bool(group.get("active_only_stack", False))
-        stack_chunk_size = int(group.get("stack_chunk_size", 0) or 0)
 
         # Get or create group-level buffers (stored in first param's state for convenience)
         p = params[0]
@@ -344,6 +402,45 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
+
+        # Hooked path: grad buffer was pre-stacked during backward via hooks.
+        # Individual grads were freed in hooks, so we use the buffer directly (no torch.stack for grads).
+        hooked_grad_buffer = state.get('_hooked_grad_buffer')
+        if hooked_grad_buffer is not None:
+            hooked_active_mask = state['_hooked_active_mask']
+            active_indices = hooked_active_mask.nonzero(as_tuple=False).squeeze(1).tolist()
+            if not active_indices:
+                return
+
+            stacked_params = torch.stack(params)
+            muon_step_fused(
+                hooked_grad_buffer,
+                stacked_params,
+                momentum_buffer,
+                second_momentum_buffer,
+                self._muon_momentum_t,
+                self._muon_lr_t,
+                self._muon_wd_t,
+                self._muon_beta2_t,
+                group["ns_steps"],
+                red_dim,
+            )
+
+            # Copy back only active params (inactive must not get weight-decay-only updates).
+            if len(active_indices) == num_params:
+                torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+            else:
+                active_params = [params[i] for i in active_indices]
+                active_values = [stacked_params[i] for i in active_indices]
+                torch._foreach_copy_(active_params, active_values)
+
+            # Reset buffers for next gradient accumulation cycle.
+            hooked_grad_buffer.zero_()
+            hooked_active_mask.zero_()
+            return
+
+        active_only_stack = bool(group.get("active_only_stack", False))
+        stack_chunk_size = int(group.get("stack_chunk_size", 0) or 0)
         active_indices = [i for i, pp in enumerate(params) if pp.grad is not None]
         if not active_indices:
             return
@@ -530,12 +627,21 @@ class MuonAdamW8bit(MuonAdamW):
             min_8bit_size=int(min_8bit_size),
         )
 
+        # Pre-compute param -> (bnb_group, gindex, pindex) for O(1) per-param updates in hooks.
+        self._param_bnb_idx: dict[int, tuple[dict, int, int]] = {}
+        for gindex, bnb_group in enumerate(self._adamw8.param_groups):
+            for pindex, p in enumerate(bnb_group["params"]):
+                self._param_bnb_idx[id(p)] = (bnb_group, gindex, pindex)
+
     def install_post_accum_hooks(self) -> None:
         if self._adamw_hooked:
             return
         if not hasattr(torch.Tensor, "register_post_accumulate_grad_hook"):
             raise RuntimeError("register_post_accumulate_grad_hook is not available in this PyTorch build.")
         self._adamw_post_accum_handles = []
+
+        # Sync hparams once upfront; subsequent syncs happen in step() before next backward.
+        self._sync_adamw8_hparams()
 
         for group in self.param_groups:
             if group["kind"] != "adamw":
@@ -548,23 +654,38 @@ class MuonAdamW8bit(MuonAdamW):
                     if param.grad is None:
                         return
                     with torch.no_grad():
-                        # Update AdamW8bit as soon as this grad is accumulated.
-                        # In hook mode we rely on grads being cleared immediately to
-                        # avoid duplicate updates across repeated .step() calls.
-                        self._sync_adamw8_hparams()
-                        self._adamw8.step()
+                        # Per-parameter bnb update: O(1) instead of iterating all params.
+                        bnb_group, gindex, pindex = self._param_bnb_idx[id(param)]
+                        state = self._adamw8.state[param]
+                        if len(state) == 0:
+                            self._adamw8.init_state(bnb_group, param, gindex, pindex)
+                        self._adamw8.prefetch_state(param)
+                        self._adamw8.update_step(bnb_group, param, gindex, pindex)
                         param.grad = None
 
                 handle = p.register_post_accumulate_grad_hook(_hook)
                 self._adamw_post_accum_handles.append(handle)
 
         self._adamw_hooked = True
+        self._install_muon_grad_hooks()
 
     def remove_post_accum_hooks(self) -> None:
         for handle in self._adamw_post_accum_handles:
             handle.remove()
         self._adamw_post_accum_handles = []
         self._adamw_hooked = False
+        # Clean up Muon hook state
+        if self._muon_hooked:
+            for group in self.param_groups:
+                if group['kind'] != 'muon':
+                    continue
+                params = group['params']
+                if not params:
+                    continue
+                state = self.state[params[0]]
+                state.pop('_hooked_grad_buffer', None)
+                state.pop('_hooked_active_mask', None)
+            self._muon_hooked = False
 
     def _sync_adamw8_hparams(self) -> None:
         for bnb_group, idx in zip(self._adamw8.param_groups, self._adamw8_group_indices):
@@ -579,6 +700,9 @@ class MuonAdamW8bit(MuonAdamW):
         if not self._adamw_hooked:
             self._sync_adamw8_hparams()
             self._adamw8.step()
+        else:
+            # In hook mode, sync hparams so the next backward's hooks use fresh values.
+            self._sync_adamw8_hparams()
         for group in self.param_groups:
             if group["kind"] == "muon":
                 self._step_muon(group)
